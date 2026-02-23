@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""
+MCP Server for Mesh — Semantic Memory API
+
+Wraps Mesh HTTP API as MCP tools for Claude Desktop, Claude Code, and other MCP clients.
+Tag schema is loaded from Mesh API (GET /schema) — single source of truth.
+
+Usage:
+    python mcp_server.py                              # stdio
+    python mcp_server.py --transport sse              # SSE on port 8100
+
+Environment:
+    MESH_API_URL   — Mesh API base URL (default: http://localhost:8000)
+    MESH_API_KEY   — API key if AUTH_REQUIRED=true
+"""
+import os
+import sys
+
+import httpx
+from mcp.server.fastmcp import FastMCP
+
+# ──────────────────────────────────────────
+# Configuration
+# ──────────────────────────────────────────
+
+MESH_URL = os.environ.get("MESH_API_URL", "http://localhost:8000").rstrip("/")
+MESH_KEY = os.environ.get("MESH_API_KEY", "")
+
+# Schema cache (loaded on first tool call)
+_schema_cache: dict | None = None
+
+
+def _headers() -> dict:
+    h = {"Content-Type": "application/json"}
+    if MESH_KEY:
+        h["X-API-Key"] = MESH_KEY
+    return h
+
+
+async def _get(path: str, params: dict = None) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"{MESH_URL}{path}", headers=_headers(), params=params)
+        r.raise_for_status()
+        return r.json()
+
+
+async def _post(path: str, body: dict) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(f"{MESH_URL}{path}", headers=_headers(), json=body)
+        r.raise_for_status()
+        return r.json()
+
+
+async def _put(path: str, body: dict) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.put(f"{MESH_URL}{path}", headers=_headers(), json=body)
+        r.raise_for_status()
+        return r.json()
+
+
+async def _patch(path: str, body: dict) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.patch(f"{MESH_URL}{path}", headers=_headers(), json=body)
+        r.raise_for_status()
+        return r.json()
+
+
+async def _delete(path: str) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.delete(f"{MESH_URL}{path}", headers=_headers())
+        r.raise_for_status()
+        return r.json()
+
+
+async def _get_schema() -> dict:
+    """Get tag schema from Mesh API (cached)."""
+    global _schema_cache
+    if _schema_cache is None:
+        try:
+            _schema_cache = await _get("/schema")
+        except Exception:
+            _schema_cache = {"prefixes": {}, "defaults": {}, "auto_infer": {}}
+    return _schema_cache
+
+
+def _project_prefix(schema: dict) -> str | None:
+    """Find the project tag prefix from schema."""
+    for key, info in schema.get("prefixes", {}).items():
+        if info.get("is_project"):
+            return info.get("prefix")
+    return None
+
+
+def _schema_summary(schema: dict) -> str:
+    """Generate human-readable schema summary for tool instructions."""
+    prefixes = schema.get("prefixes", {})
+    if not prefixes:
+        return "No tag schema. Tags are free-form key:value pairs."
+    lines = ["Tag schema:"]
+    for key, info in prefixes.items():
+        parts = [f"  {info['prefix']}  {info.get('description', key)}"]
+        if info.get("values"):
+            parts.append(f" [{', '.join(info['values'])}]")
+        if info.get("is_project"):
+            parts.append(" (PROJECT)")
+        if info.get("auto_infer"):
+            parts.append(" (auto-inferred)")
+        lines.append("".join(parts))
+    lines.append("  Auto-tags: date and source added on save. type/project/topic inferred from neighbors.")
+    lines.append("  Custom tags always allowed.")
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────
+# MCP Server
+# ──────────────────────────────────────────
+
+mcp = FastMCP(
+    "Mesh Memory",
+    instructions=(
+        "Mesh is a semantic memory system for documents with auto-tagging. "
+        "Documents get date/source tags automatically on save, and type/project/topic "
+        "tags are inferred from similar existing documents after indexing. "
+        "Use mesh_search for finding by meaning, mesh_bytag for exact tag filtering, "
+        "mesh_versions for document evolution history, mesh_schema to see tag taxonomy."
+    )
+)
+
+
+# ──────────────────────────────────────────
+# Tools
+# ──────────────────────────────────────────
+
+@mcp.tool()
+async def mesh_search(query: str, limit: int = 10, tags: list[str] | None = None) -> str:
+    """Semantic search across all documents in Mesh memory.
+
+    Args:
+        query: What to search for (natural language)
+        limit: Max results (default 10)
+        tags: Optional tag filter (AND logic)
+    """
+    body = {"query": query, "limit": limit}
+    if tags:
+        body["tags"] = tags
+    data = await _post("/search", body)
+    results = data.get("results", [])
+    if not results:
+        return f"No results found for: {query}"
+    lines = [f"Found {len(results)} results for '{query}':\n"]
+    for r in results:
+        score = r.get("similarity_score", 0)
+        guid = r.get("guid", "?")
+        tags_str = ", ".join(r.get("tags", []))
+        preview = (r.get("content", ""))[:200]
+        created = r.get("created_at", "")[:10] if r.get("created_at") else ""
+        lines.append(f"**{guid}** (score: {score}, date: {created})")
+        lines.append(f"  tags: {tags_str}")
+        lines.append(f"  {preview}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def mesh_add(content: str, tags: list[str] | None = None, source: str = "mcp") -> str:
+    """Add a new document to Mesh memory.
+
+    Date and source tags are added automatically. After indexing, type/project/topic
+    tags will be inferred from similar documents. You can set tags explicitly to
+    override auto-inference.
+
+    Args:
+        content: Document text (min 10 chars)
+        tags: Optional tags. Auto-tags won't override these.
+        source: Origin (default: "mcp")
+    """
+    body = {"content": content, "source": source}
+    if tags:
+        body["tags"] = tags
+    data = await _put("/", body)
+    guid = data.get("guid", "?")
+    final_tags = data.get("tags", [])
+    return (
+        f"Document created: {guid}\n"
+        f"Tags: {', '.join(final_tags)}\n"
+        f"Queued for indexing. Additional tags may be auto-inferred from similar documents."
+    )
+
+
+@mcp.tool()
+async def mesh_update(
+    guid: str,
+    content: str | None = None,
+    tags: list[str] | None = None,
+    add_tags: list[str] | None = None,
+    remove_tags: list[str] | None = None
+) -> str:
+    """Update an existing document's content or tags.
+
+    Args:
+        guid: Document GUID (doc_XXXXXXXX)
+        content: New content (replaces existing)
+        tags: Replace all tags with these
+        add_tags: Add tags to existing
+        remove_tags: Remove tags from existing
+    """
+    body = {}
+    if content is not None:
+        body["content"] = content
+    if tags is not None:
+        body["tags"] = tags
+    if add_tags is not None:
+        body["add_tags"] = add_tags
+    if remove_tags is not None:
+        body["remove_tags"] = remove_tags
+    if not body:
+        return "Nothing to update. Provide content, tags, add_tags, or remove_tags."
+    data = await _patch(f"/{guid}", body)
+    updated = data.get("updated_fields", [])
+    final_tags = data.get("tags", [])
+    return (
+        f"Updated {guid}\n"
+        f"Changed: {', '.join(updated) if updated else 'ok'}\n"
+        f"Tags: {', '.join(final_tags)}"
+    )
+
+
+@mcp.tool()
+async def mesh_delete(guid: str) -> str:
+    """Delete a document from Mesh memory.
+
+    Args:
+        guid: Document GUID to delete (doc_XXXXXXXX)
+    """
+    data = await _delete(f"/{guid}")
+    if data.get("deleted"):
+        return f"Deleted: {guid}"
+    return f"Failed to delete {guid}: {data}"
+
+
+@mcp.tool()
+async def mesh_get(guid: str) -> str:
+    """Get a specific document by its GUID.
+
+    Args:
+        guid: Document GUID (format: doc_XXXXXXXX)
+    """
+    data = await _get(f"/{guid}")
+    tags_str = ", ".join(data.get("tags", []))
+    created = data.get("created_at", "")[:19] if data.get("created_at") else ""
+    return (
+        f"**{data.get('guid', guid)}**\n"
+        f"Created: {created}\n"
+        f"Tags: {tags_str}\n"
+        f"Source: {data.get('source', '?')}\n\n"
+        f"{data.get('content', '')}"
+    )
+
+
+@mcp.tool()
+async def mesh_bytag(tags: list[str], limit: int = 10, offset: int = 0) -> str:
+    """List documents filtered by tags (AND logic).
+
+    Args:
+        tags: Tags to filter by
+        limit: Max documents (default 10)
+        offset: Skip N documents for pagination
+    """
+    params = {"limit": limit, "offset": offset}
+    for t in tags:
+        params.setdefault("tag", [])
+        if isinstance(params["tag"], list):
+            params["tag"].append(t)
+    data = await _get("/", params)
+    if isinstance(data, dict) and "service" in data:
+        return "No documents found"
+    if not data:
+        return f"No documents found for tags: {', '.join(tags)}"
+    lines = [f"Found {len(data)} documents:\n"]
+    for doc in data:
+        guid = doc.get("guid", "?")
+        tags_str = ", ".join(doc.get("tags", []))
+        preview = (doc.get("content", ""))[:150]
+        created = doc.get("created_at", "")[:10] if doc.get("created_at") else ""
+        lines.append(f"**{guid}** ({created})")
+        lines.append(f"  tags: {tags_str}")
+        lines.append(f"  {preview}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def mesh_versions(
+    guid: str,
+    threshold: float = 0.85,
+    limit: int = 20,
+    same_project: bool = True
+) -> str:
+    """Find chronological version chain of a document.
+
+    Args:
+        guid: Source document GUID (doc_XXXXXXXX)
+        threshold: Similarity threshold 0.5-0.99 (default 0.85)
+        limit: Max versions (default 20)
+        same_project: Only same project docs (default True)
+    """
+    params = {
+        "threshold": threshold,
+        "limit": limit,
+        "same_project": str(same_project).lower()
+    }
+    data = await _get(f"/versions/{guid}", params)
+    source = data.get("source", {})
+    versions = data.get("versions", [])
+    count = data.get("count", 0)
+    project = data.get("project_tag", "none")
+
+    lines = [
+        f"Version chain for {guid} (project: {project})",
+        f"Source: {source.get('content_length', 0)} chars, created {source.get('created_at', '?')[:10]}",
+        f"Found {count} related versions:\n"
+    ]
+    for v in versions:
+        sim = v.get("similarity", 0)
+        delta = v.get("length_delta", 0)
+        delta_str = f"+{delta}" if delta > 0 else str(delta)
+        created = v.get("created_at", "")[:10] if v.get("created_at") else "?"
+        lines.append(f"  {created} | **{v['guid']}** | sim: {sim} | {delta_str} chars")
+        if v.get("tags_added"):
+            lines.append(f"    + tags: {', '.join(v['tags_added'])}")
+        if v.get("tags_removed"):
+            lines.append(f"    - tags: {', '.join(v['tags_removed'])}")
+        lines.append(f"    {v.get('preview', '')[:120]}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def mesh_projects(limit: int = 30) -> str:
+    """List all projects with document counts and activity dates."""
+    schema = await _get_schema()
+    prefix = _project_prefix(schema)
+    if not prefix:
+        return "No project prefix configured in schema."
+
+    data = await _get("/activity", {"prefix": prefix, "limit": limit})
+    if not data:
+        return "No projects found."
+
+    lines = [f"Projects ({len(data)}):\n"]
+    for item in data:
+        tag = item.get("tag", "?")
+        project_id = tag.replace(prefix, "") if tag.startswith(prefix) else tag
+        docs = item.get("docs", 0)
+        last = item.get("last", "?")[:10] if item.get("last") else "?"
+        first = item.get("first", "?")[:10] if item.get("first") else "?"
+        lines.append(f"  {project_id}  ({docs} docs, {first} -> {last})")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def mesh_stats() -> str:
+    """Get Mesh memory statistics."""
+    data = await _get("/stats")
+    return (
+        f"Documents: {data.get('documents', 0)}\n"
+        f"Indexed: {data.get('indexed', 0)}\n"
+        f"Pending: {data.get('pending', 0)}\n"
+        f"Projects: {data.get('projects', 0)}\n"
+        f"Tags: {data.get('tags', 0)}\n"
+        f"Queue: {data.get('queue_size', 0)}\n"
+        f"Last update: {data.get('last_update', '?')}"
+    )
+
+
+@mcp.tool()
+async def mesh_recent(limit: int = 10, type: str | None = None) -> str:
+    """Get recent documents.
+
+    Args:
+        limit: Max documents (default 10)
+        type: Optional type filter (worklog, note, artifact, etc.)
+    """
+    params = {"limit": limit}
+    if type:
+        params["tag"] = f"type:{type}"
+    data = await _get("/", params)
+    if isinstance(data, dict) and "service" in data:
+        return "No documents found"
+    if not data:
+        return "No documents found"
+    lines = [f"Recent {len(data)} documents:\n"]
+    for doc in data:
+        guid = doc.get("guid", "?")
+        tags_str = ", ".join(doc.get("tags", []))
+        preview = (doc.get("content", ""))[:120]
+        created = doc.get("created_at", "")[:10] if doc.get("created_at") else ""
+        lines.append(f"**{guid}** ({created}) [{tags_str}]")
+        lines.append(f"  {preview}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def mesh_tags(prefix: str | None = None, limit: int = 50) -> str:
+    """List all unique tags with document counts.
+
+    Args:
+        prefix: Filter by prefix, e.g. "type:", "guid:", "topic:"
+        limit: Max tags (default 50)
+    """
+    params = {"limit": limit}
+    if prefix:
+        params["prefix"] = prefix
+    data = await _get("/tags", params)
+    tags = data.get("tags", [])
+    if not tags:
+        return f"No tags found{' with prefix ' + prefix if prefix else ''}"
+    lines = [f"Tags ({len(tags)}):\n"]
+    for t in tags:
+        lines.append(f"  {t['tag']} ({t['count']} docs)")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def mesh_schema() -> str:
+    """Show the tag schema: configured prefixes, auto-inference rules, defaults.
+
+    The schema defines how documents are tagged. Auto-tags (date, source) are added
+    on save. Type, project, and topic tags are inferred from similar documents.
+    """
+    schema = await _get_schema()
+    return _schema_summary(schema)
+
+
+# ──────────────────────────────────────────
+# Resources
+# ──────────────────────────────────────────
+
+@mcp.resource("mesh://doc/{guid}")
+async def get_document_resource(guid: str) -> str:
+    """Read a Mesh document by GUID."""
+    data = await _get(f"/{guid}")
+    tags_str = ", ".join(data.get("tags", []))
+    created = data.get("created_at", "")[:19] if data.get("created_at") else ""
+    return (
+        f"# {data.get('guid', guid)}\n"
+        f"Tags: {tags_str}\n"
+        f"Created: {created}\n\n"
+        f"{data.get('content', '')}"
+    )
+
+
+# ──────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────
+
+if __name__ == "__main__":
+    transport = "stdio"
+    port = int(os.environ.get("MESH_MCP_PORT", "8100"))
+
+    for i, arg in enumerate(sys.argv[1:], 1):
+        if arg == "--transport" and i < len(sys.argv) - 1:
+            transport = sys.argv[i + 1]
+        elif arg == "--port" and i < len(sys.argv) - 1:
+            port = int(sys.argv[i + 1])
+
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    elif transport == "sse":
+        os.environ["UVICORN_PORT"] = str(port)
+        mcp.run(transport="sse")
+    elif transport == "http":
+        os.environ["UVICORN_PORT"] = str(port)
+        mcp.run(transport="streamable-http")
+    else:
+        print(f"Unknown transport: {transport}", file=sys.stderr)
+        sys.exit(1)
