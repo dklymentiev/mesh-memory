@@ -229,10 +229,18 @@ embedding_worker_tasks = []
 NUM_WORKERS = 3  # Parallel embedding workers
 
 async def embedding_worker():
-    """Background worker that processes embedding queue in thread pool"""
+    """Background worker that processes embedding queue in thread pool.
+
+    Splits documents into overlapping chunks, embeds each chunk, and stores
+    them in ``doc_chunks``.  The first chunk embedding is also written to
+    ``doc_embeddings`` for backward compatibility (visualize, tag inference,
+    categorizer all read from ``doc_embeddings``).
+    """
     global embedding_queue
     logger.info("Embedding worker started")
     loop = asyncio.get_running_loop()
+
+    from .chunker import chunk_document
 
     while True:
         try:
@@ -240,27 +248,51 @@ async def embedding_worker():
             guid, content = await embedding_queue.get()
 
             try:
-                # Generate embedding in thread pool (non-blocking)
                 embedding_service = await get_embedding_service()
-                embedding = await loop.run_in_executor(
-                    None, embedding_service.generate_embedding, content
-                )
-                await embedding_crud.store_embedding(guid, embedding)
-                _visualize_cache.clear()  # invalidate visualize cache
-                logger.info(f"Indexed {guid} (queue: {embedding_queue.qsize()})")
 
-                # Auto-infer tags from nearest neighbors
+                # Split into chunks
+                chunks = chunk_document(content)
+                if not chunks:
+                    logger.warning(f"Chunker returned empty for {guid}, skipping")
+                    continue
+
+                # Batch-embed all chunks in thread pool
+                embeddings = await loop.run_in_executor(
+                    None, embedding_service.generate_embeddings_batch, chunks
+                )
+
+                # Store chunks in doc_chunks (delete old first for re-index)
+                async with db_pool.acquire() as conn:
+                    await conn.execute("DELETE FROM doc_chunks WHERE guid = $1", guid)
+                    for idx, (chunk_text, emb) in enumerate(zip(chunks, embeddings)):
+                        emb_str = '[' + ','.join(map(str, emb)) + ']'
+                        await conn.execute(
+                            """INSERT INTO doc_chunks (guid, chunk_index, chunk_text, embedding)
+                               VALUES ($1, $2, $3, $4::vector)
+                               ON CONFLICT (guid, chunk_index) DO UPDATE SET
+                                   chunk_text = EXCLUDED.chunk_text,
+                                   embedding = EXCLUDED.embedding""",
+                            guid, idx, chunk_text, emb_str
+                        )
+
+                # Backward compat: store first chunk embedding in doc_embeddings
+                first_embedding = embeddings[0]
+                await embedding_crud.store_embedding(guid, first_embedding)
+                _visualize_cache.clear()
+                logger.info(f"Indexed {guid}: {len(chunks)} chunks (queue: {embedding_queue.qsize()})")
+
+                # Auto-infer tags from nearest neighbors (uses doc_embeddings)
                 if tag_schema.infer_enabled:
                     try:
                         await _infer_tags_from_neighbors(guid)
                     except Exception as infer_err:
                         logger.warning(f"Tag inference failed for {guid}: {infer_err}")
 
-                # AI categorizer (if enabled and taxonomy exists)
+                # AI categorizer (uses first chunk embedding)
                 if is_categorizer_enabled():
                     try:
                         from .categorizer import classify as categorizer_classify
-                        await categorizer_classify(guid, content, embedding, db_pool)
+                        await categorizer_classify(guid, chunks[0], first_embedding, db_pool)
                     except Exception as cat_err:
                         logger.warning(f"Categorizer failed for {guid}: {cat_err}")
             except Exception as e:
@@ -354,7 +386,7 @@ async def lifespan(app: FastAPI):
                 WHERE e.guid IS NULL
             """)
             for row in pending:
-                await embedding_queue.put((row['guid'], row['content'][:4000]))
+                await embedding_queue.put((row['guid'], row['content']))
             if pending:
                 logger.info(f"Requeued {len(pending)} pending documents for indexing")
 
@@ -667,7 +699,7 @@ async def create_document(request: DocumentCreateRequest):
         document = await document_crud.create_document(guid, request)
 
         # Queue embedding generation (async, non-blocking)
-        await embedding_queue.put((guid, request.content[:4000]))
+        await embedding_queue.put((guid, request.content))
 
         logger.info(f"Created document {guid}, queued for embedding")
         return document
@@ -717,7 +749,7 @@ async def upsert_document(guid: str, request: DocumentCreateRequest):
         document = await document_crud.upsert_document(guid, request)
 
         # Queue embedding generation (async, non-blocking)
-        await embedding_queue.put((guid, request.content[:4000]))
+        await embedding_queue.put((guid, request.content))
 
         logger.info(f"Upserted document {guid}, queued for embedding")
         return document
@@ -1082,13 +1114,22 @@ async def search_documents(request: SearchRequest):
             )
             _put_cached_embedding(request.query, query_embedding)
 
-        # Semantic search (optionally filtered by tags)
-        similar_docs = await embedding_crud.search_similar_documents(
-            query_embedding=query_embedding,
-            limit=limit,
-            similarity_threshold=get_similarity_threshold(),
-            tags=request.tags
-        )
+        # Semantic search: prefer chunk-based search, fallback to doc_embeddings
+        _use_chunks = await embedding_crud.has_chunks()
+        if _use_chunks:
+            similar_docs = await embedding_crud.search_similar_chunks(
+                query_embedding=query_embedding,
+                limit=limit,
+                similarity_threshold=get_similarity_threshold(),
+                tags=request.tags
+            )
+        else:
+            similar_docs = await embedding_crud.search_similar_documents(
+                query_embedding=query_embedding,
+                limit=limit,
+                similarity_threshold=get_similarity_threshold(),
+                tags=request.tags
+            )
 
         # Build results from semantic search (batch fetch to avoid N+1)
         results = []
@@ -1499,7 +1540,7 @@ async def bulk_create_documents(documents: List[DocumentCreateRequest]):
             guid = generate_document_guid()
 
             await document_crud.create_document(guid, doc)
-            await embedding_queue.put((guid, doc.content[:4000]))
+            await embedding_queue.put((guid, doc.content))
             created += 1
         except Exception as e:
             logger.error(f"Bulk create error: {e}")

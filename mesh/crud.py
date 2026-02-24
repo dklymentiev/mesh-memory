@@ -300,7 +300,78 @@ class EmbeddingCRUD:
             except Exception as e:
                 logger.error(f"Failed to search similar documents: {e}")
                 raise
-    
+
+    async def search_similar_chunks(
+        self,
+        query_embedding: List[float],
+        limit: int = 10,
+        similarity_threshold: float = 0.0,
+        tags: Optional[List[str]] = None
+    ) -> List[Tuple[str, float]]:
+        """Search for similar documents via chunk-level embeddings.
+
+        Searches across all chunks, then deduplicates to document level
+        by taking the maximum similarity score per document GUID.
+        """
+        async with self.pool.acquire() as conn:
+            try:
+                query_vector = '[' + ','.join(map(str, query_embedding)) + ']'
+                # Fetch more chunks than needed to ensure enough unique docs
+                chunk_limit = limit * 5
+
+                if tags:
+                    rows = await conn.fetch(
+                        """
+                        SELECT guid, MAX(sim) AS similarity_score
+                        FROM (
+                            SELECT c.guid,
+                                   1 - (c.embedding <=> $1::vector) AS sim
+                            FROM doc_chunks c
+                            JOIN documents d ON d.guid = c.guid
+                            WHERE d.tags @> $4::text[]
+                            ORDER BY c.embedding <=> $1::vector
+                            LIMIT $3
+                        ) sub
+                        WHERE sim >= $2
+                        GROUP BY guid
+                        ORDER BY similarity_score DESC
+                        LIMIT $5
+                        """,
+                        query_vector, similarity_threshold, chunk_limit, tags, limit
+                    )
+                else:
+                    rows = await conn.fetch(
+                        """
+                        SELECT guid, MAX(sim) AS similarity_score
+                        FROM (
+                            SELECT c.guid,
+                                   1 - (c.embedding <=> $1::vector) AS sim
+                            FROM doc_chunks c
+                            ORDER BY c.embedding <=> $1::vector
+                            LIMIT $3
+                        ) sub
+                        WHERE sim >= $2
+                        GROUP BY guid
+                        ORDER BY similarity_score DESC
+                        LIMIT $4
+                        """,
+                        query_vector, similarity_threshold, chunk_limit, limit
+                    )
+
+                return [(row['guid'], float(row['similarity_score'])) for row in rows]
+
+            except Exception as e:
+                logger.error(f"Failed to search similar chunks: {e}")
+                raise
+
+    async def has_chunks(self) -> bool:
+        """Check if doc_chunks table has any data."""
+        async with self.pool.acquire() as conn:
+            try:
+                count = await conn.fetchval("SELECT COUNT(*) FROM doc_chunks")
+                return count > 0
+            except Exception:
+                return False
 
 
 class MetadataCRUD:

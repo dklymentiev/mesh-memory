@@ -116,4 +116,25 @@ async def create_tables(pool: asyncpg.Pool) -> None:
             ON category_centroids USING hnsw (centroid vector_cosine_ops)
         """)
 
+        # Create doc_chunks table for full-content search via chunked embeddings
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS doc_chunks (
+                id SERIAL PRIMARY KEY,
+                guid VARCHAR(32) NOT NULL REFERENCES documents(guid) ON DELETE CASCADE,
+                chunk_index SMALLINT NOT NULL,
+                chunk_text TEXT NOT NULL,
+                embedding vector(768),
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(guid, chunk_index)
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS doc_chunks_guid_idx ON doc_chunks(guid)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS doc_chunks_hnsw_idx
+            ON doc_chunks USING hnsw (embedding vector_cosine_ops)
+            WITH (m = 16, ef_construction = 64)
+        """)
+
         logger.info("Database tables created successfully")
