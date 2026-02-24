@@ -9,6 +9,7 @@ Loads all documents, chunks each, batch-embeds, stores in doc_chunks.
 Also updates doc_embeddings with first-chunk embedding for consistency.
 """
 import asyncio
+import gc
 import logging
 import os
 import sys
@@ -53,12 +54,15 @@ async def main():
             CREATE INDEX IF NOT EXISTS doc_chunks_guid_idx ON doc_chunks(guid)
         """)
 
-    # Load all documents
+    # Load only documents that don't have chunks yet
     async with pool.acquire() as conn:
         docs = await conn.fetch(
-            "SELECT guid, content FROM documents ORDER BY created_at"
+            """SELECT d.guid, d.content FROM documents d
+               LEFT JOIN (SELECT DISTINCT guid FROM doc_chunks) c ON c.guid = d.guid
+               WHERE c.guid IS NULL
+               ORDER BY d.created_at"""
         )
-    logger.info(f"Loaded {len(docs)} documents")
+    logger.info(f"Found {len(docs)} documents without chunks")
 
     # Initialize embedding service
     embedding_service = await get_embedding_service()
@@ -103,6 +107,10 @@ async def main():
 
         total_chunks += len(chunks)
         processed += 1
+
+        # Free memory after each doc to avoid OOM
+        del embeddings, chunks
+        gc.collect()
 
         if processed % 50 == 0:
             logger.info(f"  Processed {processed}/{len(docs)} docs, {total_chunks} chunks so far...")

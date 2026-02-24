@@ -317,7 +317,8 @@ class EmbeddingCRUD:
             try:
                 query_vector = '[' + ','.join(map(str, query_embedding)) + ']'
                 # Fetch more chunks than needed to ensure enough unique docs
-                chunk_limit = limit * 5
+                # (a single doc with 20 chunks can dominate the top-N)
+                chunk_limit = limit * 10
 
                 if tags:
                     rows = await conn.fetch(
