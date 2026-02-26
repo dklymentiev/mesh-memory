@@ -4,11 +4,12 @@ Database CRUD operations for documents and embeddings
 """
 import asyncpg
 import hashlib
+from contextlib import asynccontextmanager
 from typing import List, Optional, Tuple
 from datetime import datetime, timezone
 import logging
 
-from .models import DocumentCreateRequest, DocumentResponse, MetadataRequest, MetadataResponse
+from .models import DocumentCreateRequest, DocumentResponse, MetadataRequest, MetadataResponse, AuthContext
 
 logger = logging.getLogger(__name__)
 
@@ -17,13 +18,42 @@ def compute_content_hash(content: str) -> str:
     """Compute MD5 hash of content"""
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
+
+async def _apply_rls(conn, auth: Optional[AuthContext]):
+    """Set RLS session vars on a connection if auth context is provided.
+
+    Admin override (app.is_admin=true) is only set when workspace is '*'
+    (all workspaces). Otherwise, even admin keys are scoped by workspace list.
+    """
+    if auth is None:
+        return
+    workspaces_csv = ",".join(auth.workspaces) if auth.workspaces else auth.workspace
+    # Only bypass RLS when explicitly requesting all workspaces
+    rls_admin = auth.is_admin and workspaces_csv == "*"
+    await conn.execute("SELECT set_config('app.workspaces', $1, false)", workspaces_csv)
+    await conn.execute("SELECT set_config('app.is_admin', $1, false)", str(rls_admin).lower())
+
+
 class DocumentCRUD:
     """Database operations for documents"""
-    
-    def __init__(self, pool: asyncpg.Pool):
+
+    def __init__(self, pool: asyncpg.Pool, auth: Optional[AuthContext] = None):
         self.pool = pool
+        self._auth = auth
+
+    def with_auth(self, auth: AuthContext) -> "DocumentCRUD":
+        """Return a new CRUD instance bound to the given auth context."""
+        return DocumentCRUD(self.pool, auth)
+
+    @asynccontextmanager
+    async def _conn(self):
+        """Acquire a connection with RLS context set."""
+        async with self.pool.acquire() as conn:
+            await _apply_rls(conn, self._auth)
+            yield conn
     
-    async def create_document(self, guid: str, request: DocumentCreateRequest) -> DocumentResponse:
+    async def create_document(self, guid: str, request: DocumentCreateRequest,
+                              workspace_id: str = "default") -> DocumentResponse:
         """Create a new document in the database"""
         now = datetime.now(timezone.utc)
         created_at = request.created_at or now
@@ -33,7 +63,7 @@ class DocumentCRUD:
         filename = request.filename
         source = request.source or "api"
 
-        async with self.pool.acquire() as conn:
+        async with self._conn() as conn:
             try:
                 # Dedup: check if document with same content already exists
                 existing = await conn.fetchrow(
@@ -55,16 +85,19 @@ class DocumentCRUD:
                         tags=list(row['tags']) if row['tags'] else [],
                         created_at=row['created_at'],
                         updated_at=row['updated_at'],
-                        directory="inbox"
+                        directory="inbox",
+                        workspace=row.get('workspace_id', 'default')
                     )
 
                 # Insert document
                 await conn.execute(
                     """
-                    INSERT INTO documents (guid, content, content_hash, filename, source, tags, created_at, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    INSERT INTO documents (guid, content, content_hash, filename, source, tags,
+                                           created_at, updated_at, workspace_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     """,
-                    guid, request.content, content_hash, filename, source, tags, created_at, updated_at
+                    guid, request.content, content_hash, filename, source, tags,
+                    created_at, updated_at, workspace_id
                 )
 
                 return DocumentResponse(
@@ -76,7 +109,8 @@ class DocumentCRUD:
                     tags=tags,
                     created_at=created_at,
                     updated_at=updated_at,
-                    directory="inbox"
+                    directory="inbox",
+                    workspace=workspace_id
                 )
 
             except asyncpg.UniqueViolationError:
@@ -86,7 +120,8 @@ class DocumentCRUD:
                 logger.error(f"Failed to create document {guid}: {e}")
                 raise
 
-    async def upsert_document(self, guid: str, request: DocumentCreateRequest) -> DocumentResponse:
+    async def upsert_document(self, guid: str, request: DocumentCreateRequest,
+                              workspace_id: str = "default") -> DocumentResponse:
         """Create or update a document by GUID"""
         now = datetime.now(timezone.utc)
         updated_at = request.updated_at or now
@@ -97,12 +132,13 @@ class DocumentCRUD:
 
         created_at = request.created_at or now
 
-        async with self.pool.acquire() as conn:
+        async with self._conn() as conn:
             try:
                 row = await conn.fetchrow(
                     """
-                    INSERT INTO documents (guid, content, content_hash, filename, source, tags, created_at, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    INSERT INTO documents (guid, content, content_hash, filename, source, tags,
+                                           created_at, updated_at, workspace_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     ON CONFLICT (guid) DO UPDATE SET
                         content = EXCLUDED.content,
                         content_hash = EXCLUDED.content_hash,
@@ -113,7 +149,8 @@ class DocumentCRUD:
                         created_at = COALESCE($7, documents.created_at)
                     RETURNING created_at
                     """,
-                    guid, request.content, content_hash, filename, source, tags, created_at, updated_at
+                    guid, request.content, content_hash, filename, source, tags,
+                    created_at, updated_at, workspace_id
                 )
                 logger.info(f"Upserted document {guid}")
 
@@ -126,7 +163,8 @@ class DocumentCRUD:
                     tags=tags,
                     created_at=row['created_at'],
                     updated_at=updated_at,
-                    directory="inbox"
+                    directory="inbox",
+                    workspace=workspace_id
                 )
 
             except Exception as e:
@@ -134,12 +172,13 @@ class DocumentCRUD:
                 raise
 
     async def get_document_by_guid(self, guid: str) -> Optional[DocumentResponse]:
-        """Get a document by its GUID"""
-        async with self.pool.acquire() as conn:
+        """Get a document by its GUID (RLS filters automatically)"""
+        async with self._conn() as conn:
             try:
                 row = await conn.fetchrow(
                     """
-                    SELECT guid, content, content_hash, filename, source, tags, created_at, updated_at
+                    SELECT guid, content, content_hash, filename, source, tags,
+                           created_at, updated_at, workspace_id
                     FROM documents
                     WHERE guid = $1
                     """,
@@ -158,7 +197,8 @@ class DocumentCRUD:
                     tags=row['tags'] or [],
                     created_at=row['created_at'],
                     updated_at=row['updated_at'],
-                    directory="inbox"
+                    directory="inbox",
+                    workspace=row.get('workspace_id', 'default')
                 )
 
             except Exception as e:
@@ -175,7 +215,7 @@ class DocumentCRUD:
 
         Used as a fallback/complement to semantic search for exact term matching.
         """
-        async with self.pool.acquire() as conn:
+        async with self._conn() as conn:
             try:
                 # Escape ILIKE special characters to prevent wildcard injection
                 escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -184,7 +224,8 @@ class DocumentCRUD:
                 if tags:
                     rows = await conn.fetch(
                         """
-                        SELECT guid, content, content_hash, filename, source, tags, created_at, updated_at
+                        SELECT guid, content, content_hash, filename, source, tags,
+                               created_at, updated_at, workspace_id
                         FROM documents
                         WHERE content ILIKE $1
                           AND tags @> $3::text[]
@@ -196,7 +237,8 @@ class DocumentCRUD:
                 else:
                     rows = await conn.fetch(
                         """
-                        SELECT guid, content, content_hash, filename, source, tags, created_at, updated_at
+                        SELECT guid, content, content_hash, filename, source, tags,
+                               created_at, updated_at, workspace_id
                         FROM documents
                         WHERE content ILIKE $1
                         ORDER BY updated_at DESC
@@ -215,7 +257,8 @@ class DocumentCRUD:
                         tags=row['tags'] or [],
                         created_at=row['created_at'],
                         updated_at=row['updated_at'],
-                        directory="inbox"
+                        directory="inbox",
+                        workspace=row.get('workspace_id', 'default')
                     )
                     for row in rows
                 ]
@@ -227,13 +270,24 @@ class DocumentCRUD:
 
 class EmbeddingCRUD:
     """Database operations for embeddings"""
-    
-    def __init__(self, pool: asyncpg.Pool):
+
+    def __init__(self, pool: asyncpg.Pool, auth: Optional[AuthContext] = None):
         self.pool = pool
+        self._auth = auth
+
+    def with_auth(self, auth: AuthContext) -> "EmbeddingCRUD":
+        """Return a new CRUD instance bound to the given auth context."""
+        return EmbeddingCRUD(self.pool, auth)
+
+    @asynccontextmanager
+    async def _conn(self):
+        async with self.pool.acquire() as conn:
+            await _apply_rls(conn, self._auth)
+            yield conn
     
     async def store_embedding(self, guid: str, embedding: List[float]) -> None:
         """Store an embedding for a document"""
-        async with self.pool.acquire() as conn:
+        async with self._conn() as conn:
             try:
                 # Convert list to vector format for PostgreSQL
                 embedding_str = '[' + ','.join(map(str, embedding)) + ']'
@@ -264,7 +318,7 @@ class EmbeddingCRUD:
             tags: If provided, only return documents containing ALL of these tags
                   (PostgreSQL array @> operator).
         """
-        async with self.pool.acquire() as conn:
+        async with self._conn() as conn:
             try:
                 query_vector = '[' + ','.join(map(str, query_embedding)) + ']'
 
@@ -313,7 +367,7 @@ class EmbeddingCRUD:
         Searches across all chunks, then deduplicates to document level
         by taking the maximum similarity score per document GUID.
         """
-        async with self.pool.acquire() as conn:
+        async with self._conn() as conn:
             try:
                 query_vector = '[' + ','.join(map(str, query_embedding)) + ']'
                 # Fetch more chunks than needed to ensure enough unique docs
@@ -367,7 +421,7 @@ class EmbeddingCRUD:
 
     async def has_chunks(self) -> bool:
         """Check if doc_chunks table has any data."""
-        async with self.pool.acquire() as conn:
+        async with self._conn() as conn:
             try:
                 count = await conn.fetchval("SELECT COUNT(*) FROM doc_chunks")
                 return count > 0
@@ -378,13 +432,23 @@ class EmbeddingCRUD:
 class MetadataCRUD:
     """Database operations for document metadata"""
 
-    def __init__(self, pool: asyncpg.Pool):
+    def __init__(self, pool: asyncpg.Pool, auth: Optional[AuthContext] = None):
         self.pool = pool
+        self._auth = auth
+
+    def with_auth(self, auth: AuthContext) -> "MetadataCRUD":
+        return MetadataCRUD(self.pool, auth)
+
+    @asynccontextmanager
+    async def _conn(self):
+        async with self.pool.acquire() as conn:
+            await _apply_rls(conn, self._auth)
+            yield conn
 
     async def get_metadata(self, guid: str) -> Optional[MetadataResponse]:
         """Get metadata for a document"""
         import json
-        async with self.pool.acquire() as conn:
+        async with self._conn() as conn:
             try:
                 row = await conn.fetchrow(
                     """
@@ -419,7 +483,7 @@ class MetadataCRUD:
         """Create or update metadata for a document"""
         now = datetime.now(timezone.utc)
 
-        async with self.pool.acquire() as conn:
+        async with self._conn() as conn:
             try:
                 # Check if document exists
                 doc_exists = await conn.fetchval(
@@ -461,7 +525,7 @@ class MetadataCRUD:
 
     async def delete_metadata(self, guid: str) -> bool:
         """Delete metadata for a document"""
-        async with self.pool.acquire() as conn:
+        async with self._conn() as conn:
             try:
                 result = await conn.execute(
                     "DELETE FROM document_metadata WHERE guid = $1",
@@ -476,7 +540,7 @@ class MetadataCRUD:
     async def list_by_type(self, doc_type: str, limit: int = 100) -> List[MetadataResponse]:
         """List all metadata of a specific type"""
         import json
-        async with self.pool.acquire() as conn:
+        async with self._conn() as conn:
             try:
                 rows = await conn.fetch(
                     """

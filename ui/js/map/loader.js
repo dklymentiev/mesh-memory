@@ -1,5 +1,5 @@
 import { state } from './state.js';
-import { API } from './constants.js';
+import { API, wsHeaders } from './constants.js';
 import { buildScene } from './builder.js';
 import { initDocCardPool } from './doccards.js';
 
@@ -24,7 +24,7 @@ export async function loadData() {
   showLoader('Fetching documents...', 10);
 
   try {
-    const r = await fetch(url);
+    const r = await fetch(url, { headers: wsHeaders() });
     showLoader('Parsing response...', 30);
     const data = await r.json();
     if (data.error) {
@@ -73,7 +73,7 @@ export function initLoadButton() {
 }
 
 export function fetchStats() {
-  fetch(API + '/stats').then(r => r.json()).then(d => {
+  fetch(API + '/stats', { headers: wsHeaders() }).then(r => r.json()).then(d => {
     document.getElementById('st-docs').textContent = d.documents;
     document.getElementById('st-idx').textContent = d.indexed;
   }).catch(() => {});

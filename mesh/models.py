@@ -2,9 +2,20 @@
 """
 Pydantic models for API requests and responses
 """
+from dataclasses import dataclass, field as dc_field
 from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel, Field
+
+
+# ---- Auth context (not a Pydantic model -- internal only) ----
+
+@dataclass
+class AuthContext:
+    """Resolved authentication context for the current request."""
+    workspace: str = "default"           # active workspace
+    workspaces: list = dc_field(default_factory=lambda: ["default"])  # all allowed
+    is_admin: bool = False
 
 class DocumentCreateRequest(BaseModel):
     """Request model for creating a document"""
@@ -26,6 +37,7 @@ class DocumentResponse(BaseModel):
     created_at: datetime = Field(..., description="Document creation timestamp")
     updated_at: Optional[datetime] = Field(default=None, description="Last update timestamp")
     directory: str = Field(..., description="Assigned directory path")
+    workspace: str = Field(default="default", description="Workspace ID")
 
 class SearchRequest(BaseModel):
     """Request model for semantic search"""
@@ -41,6 +53,7 @@ class SearchResult(BaseModel):
     created_at: datetime = Field(..., description="Document creation timestamp")
     similarity_score: float = Field(..., description="Similarity score (0-1)")
     directory: str = Field(..., description="Document directory")
+    workspace: str = Field(default="default", description="Workspace ID")
 
 class SearchResponse(BaseModel):
     """Response model for search results"""

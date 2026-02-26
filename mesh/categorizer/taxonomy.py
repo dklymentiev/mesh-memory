@@ -19,8 +19,9 @@ TAXONOMY_TOPIC = "topic:ai-categorizer"
 class TaxonomyStore:
     """Manages taxonomy persistence and centroid cache."""
 
-    def __init__(self, pool: asyncpg.Pool):
+    def __init__(self, pool: asyncpg.Pool, workspace_id: str = "default"):
         self.pool = pool
+        self.workspace_id = workspace_id
         # In-memory cache: category_id -> (centroid_vector, parent_id, name)
         self._centroids: Dict[str, Tuple[np.ndarray, Optional[str], str]] = {}
         self._taxonomy: Optional[Taxonomy] = None
@@ -60,17 +61,21 @@ class TaxonomyStore:
         Returns number of rows upserted.
         """
         async with self.pool.acquire() as conn:
-            # Clear old centroids and insert new
-            await conn.execute("DELETE FROM category_centroids")
+            # Clear old centroids for THIS workspace only and insert new
+            await conn.execute(
+                "DELETE FROM category_centroids WHERE workspace_id = $1",
+                self.workspace_id,
+            )
             count = 0
             for cat_id, parent_id, name, desc, centroid, doc_count in centroids:
                 vec_str = "[" + ",".join(map(str, centroid)) + "]"
                 await conn.execute(
                     """
                     INSERT INTO category_centroids
-                        (category_id, parent_id, name, description, centroid, doc_count)
-                    VALUES ($1, $2, $3, $4, $5::vector, $6)
-                    ON CONFLICT (category_id) DO UPDATE SET
+                        (category_id, workspace_id, parent_id, name, description,
+                         centroid, doc_count)
+                    VALUES ($1, $2, $3, $4, $5, $6::vector, $7)
+                    ON CONFLICT (category_id, workspace_id) DO UPDATE SET
                         parent_id = EXCLUDED.parent_id,
                         name = EXCLUDED.name,
                         description = EXCLUDED.description,
@@ -78,7 +83,8 @@ class TaxonomyStore:
                         doc_count = EXCLUDED.doc_count,
                         updated_at = NOW()
                     """,
-                    cat_id, parent_id, name, desc, vec_str, doc_count,
+                    cat_id, self.workspace_id, parent_id, name, desc,
+                    vec_str, doc_count,
                 )
                 count += 1
 
@@ -108,13 +114,23 @@ class TaxonomyStore:
     async def _load_taxonomy_doc(self) -> Optional[Taxonomy]:
         """Find and parse the taxonomy document from Mesh."""
         async with self.pool.acquire() as conn:
+            # Set RLS context for workspace isolation
+            await conn.execute(
+                "SELECT set_config('app.workspaces', $1, false)",
+                self.workspace_id,
+            )
+            await conn.execute(
+                "SELECT set_config('app.is_admin', 'false', false)"
+            )
             row = await conn.fetchrow(
                 """
                 SELECT content FROM documents
                 WHERE tags @> $1::text[]
+                  AND workspace_id = $2
                 ORDER BY updated_at DESC LIMIT 1
                 """,
                 [TAXONOMY_TAG, TAXONOMY_TOPIC],
+                self.workspace_id,
             )
             if not row:
                 return None
@@ -134,14 +150,24 @@ class TaxonomyStore:
         tags = [TAXONOMY_TAG, TAXONOMY_TOPIC, "status:active"]
 
         async with self.pool.acquire() as conn:
-            # Check for existing taxonomy doc
+            # Set RLS context for workspace isolation
+            await conn.execute(
+                "SELECT set_config('app.workspaces', $1, false)",
+                self.workspace_id,
+            )
+            await conn.execute(
+                "SELECT set_config('app.is_admin', 'false', false)"
+            )
+            # Check for existing taxonomy doc in this workspace
             existing = await conn.fetchrow(
                 """
                 SELECT guid FROM documents
                 WHERE tags @> $1::text[]
+                  AND workspace_id = $2
                 ORDER BY updated_at DESC LIMIT 1
                 """,
                 [TAXONOMY_TAG, TAXONOMY_TOPIC],
+                self.workspace_id,
             )
 
             now = datetime.now(timezone.utc)
@@ -159,23 +185,26 @@ class TaxonomyStore:
                 )
             else:
                 guid = "doc_" + hashlib.md5(
-                    f"taxonomy-{now.isoformat()}".encode()
+                    f"taxonomy-{self.workspace_id}-{now.isoformat()}".encode()
                 ).hexdigest()[:8]
                 await conn.execute(
                     """
-                    INSERT INTO documents (guid, content, content_hash, source, tags, created_at, updated_at)
-                    VALUES ($1, $2, $3, 'system', $4, $5, $5)
+                    INSERT INTO documents
+                        (guid, content, content_hash, source, tags, workspace_id, created_at, updated_at)
+                    VALUES ($1, $2, $3, 'system', $4, $5, $6, $6)
                     """,
-                    guid, content, content_hash, tags, now,
+                    guid, content, content_hash, tags, self.workspace_id, now,
                 )
             return guid
 
     async def _load_centroids(self) -> None:
-        """Load all centroids from DB into memory cache."""
+        """Load centroids for this workspace from DB into memory cache."""
         self._centroids.clear()
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT category_id, parent_id, name, centroid FROM category_centroids"
+                "SELECT category_id, parent_id, name, centroid "
+                "FROM category_centroids WHERE workspace_id = $1",
+                self.workspace_id,
             )
             for row in rows:
                 raw = row["centroid"]
@@ -191,3 +220,52 @@ class TaxonomyStore:
                     row["parent_id"],
                     row["name"],
                 )
+
+    async def upsert_centroid(
+        self,
+        category_id: str,
+        name: str,
+        description: str = "",
+        parent_id: Optional[str] = None,
+        centroid: Optional[List[float]] = None,
+    ) -> None:
+        """Insert or update a single category centroid."""
+        async with self.pool.acquire() as conn:
+            vec_str = (
+                "[" + ",".join(map(str, centroid)) + "]" if centroid else None
+            )
+            await conn.execute(
+                """
+                INSERT INTO category_centroids
+                    (category_id, workspace_id, parent_id, name, description,
+                     centroid, doc_count)
+                VALUES ($1, $2, $3, $4, $5, $6::vector, 0)
+                ON CONFLICT (category_id, workspace_id) DO UPDATE SET
+                    parent_id = EXCLUDED.parent_id,
+                    name = EXCLUDED.name,
+                    description = EXCLUDED.description,
+                    centroid = COALESCE(EXCLUDED.centroid,
+                                       category_centroids.centroid),
+                    updated_at = NOW()
+                """,
+                category_id, self.workspace_id, parent_id, name,
+                description, vec_str,
+            )
+        await self._load_centroids()
+
+    async def delete_centroid(self, category_id: str) -> bool:
+        """Delete a category and its subcategories. Returns True if any rows deleted."""
+        async with self.pool.acquire() as conn:
+            # Delete subcategories (parent_id = category_id)
+            await conn.execute(
+                "DELETE FROM category_centroids "
+                "WHERE parent_id = $1 AND workspace_id = $2",
+                category_id, self.workspace_id,
+            )
+            result = await conn.execute(
+                "DELETE FROM category_centroids "
+                "WHERE category_id = $1 AND workspace_id = $2",
+                category_id, self.workspace_id,
+            )
+        await self._load_centroids()
+        return result != "DELETE 0"

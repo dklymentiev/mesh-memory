@@ -16,6 +16,7 @@
   <nav>
     <a href="/ui/">Search</a>
     <a href="/ui/map.html" class="active">Map</a>
+    <a href="/ui/settings.html">Settings</a>
   </nav>
   <div class="topbar-controls">
     <div class="view-toggle">
@@ -24,6 +25,11 @@
     </div>
     <label>Limit
       <input type="number" id="ctl-limit" value="10000" min="10" max="10000" step="500">
+    </label>
+    <label>Space
+      <select id="ctl-workspace">
+        <option value="">default</option>
+      </select>
     </label>
     <label>Type
       <select id="ctl-type">

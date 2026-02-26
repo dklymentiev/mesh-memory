@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { state } from './state.js';
-import { API, SEARCH_TRANS_MS } from './constants.js';
+import { API, SEARCH_TRANS_MS, wsHeaders } from './constants.js';
 import { scene } from './scene.js';
 import { getCategoryId, getCatColor, getCatName, getProjectGuid } from './taxonomy.js';
 import { animateCamera } from './views.js';
@@ -372,7 +372,7 @@ async function doSemanticSearch(query) {
     if (typeTag) body.tags = [typeTag];
     const r = await fetch(API + '/search', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: wsHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(body)
     });
     const data = await r.json();

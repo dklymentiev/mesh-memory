@@ -1,9 +1,9 @@
-import { API, CAT_PALETTE } from './constants.js';
+import { API, CAT_PALETTE, wsHeaders } from './constants.js';
 import { state } from './state.js';
 
 export async function loadTaxonomy() {
   try {
-    const r = await fetch(API + '/categorizer/taxonomy');
+    const r = await fetch(API + '/categorizer/taxonomy', { headers: wsHeaders() });
     const data = await r.json();
     const cats = (data.taxonomy && data.taxonomy.categories) || [];
     cats.forEach((c, i) => {

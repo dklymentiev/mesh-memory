@@ -16,6 +16,7 @@ services:
       - "127.0.0.1:5433:5432"
     volumes:
       - mesh_postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/10-mesh-app-role.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-meshdb}"]
       interval: 10s
@@ -46,7 +47,11 @@ services:
       - "traefik.http.routers.mesh.middlewares=mesh-vpn@file"
       - "traefik.http.services.mesh.loadbalancer.server.port=8000"
     environment:
+      # Superuser connection (for migrations)
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-meshdb}
+      # App role connection (RLS enforced) -- falls back to DATABASE_URL if not set
+      DATABASE_URL_APP: ${DATABASE_URL_APP:-}
+      MESH_APP_PASSWORD: ${MESH_APP_PASSWORD:-}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-intfloat/multilingual-e5-base}
       AUTH_REQUIRED: ${AUTH_REQUIRED:-false}
       API_KEYS: ${API_KEYS:-}

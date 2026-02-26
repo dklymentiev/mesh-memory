@@ -1,5 +1,17 @@
 export const API = window.location.origin;
 
+export function getWorkspace() {
+  const el = document.getElementById('ctl-workspace');
+  return el ? el.value : '';
+}
+
+export function wsHeaders(extra) {
+  const h = extra ? { ...extra } : {};
+  const ws = getWorkspace();
+  if (ws) h['X-Workspace'] = ws;
+  return h;
+}
+
 export const CAT_PALETTE = [
   '#4fc3f7','#81c784','#ff8a65','#ba68c8','#ffd54f',
   '#4db6ac','#e57373','#64b5f6','#aed581','#ffb74d',
