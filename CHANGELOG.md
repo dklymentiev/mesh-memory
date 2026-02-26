@@ -9,37 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_(nothing yet)_
+
+---
+
+## [1.3.0] - 2026-02-25
+
 ### Added
-- **AI Categorizer** (opt-in): automatic document classification using LLM
+- **Workspace multi-tenancy**: full document isolation per workspace via RLS
+  - `X-Workspace` header selects active workspace on every request
+  - Scoped API keys with per-workspace access (`POST /admin/keys`)
+  - `api_keys` table: key hash, label, workspace list, admin flag
+  - `GET /admin/workspaces` -- list workspaces with doc counts
+  - `DELETE /admin/workspaces/{name}` -- delete workspace and all its docs
+  - `GET /admin/config` -- server configuration overview
+  - Default workspace `default` -- fully backward-compatible
+- **AI Categorizer** (opt-in): automatic document classification
   - Embedding-based + LLM-based classifiers with configurable thresholds
-  - Category taxonomy with subcategories
-  - API endpoints: `/categorizer/taxonomy`, `/categorizer/bootstrap`, `/categorizer/batch`
+  - Category taxonomy with subcategories, workspace-scoped (each workspace gets its own)
+  - Bootstrap modes: `cluster` (HDBSCAN bottom-up) and `designed` (LLM top-down)
+  - API endpoints: `/categorizer/taxonomy`, `/categorizer/bootstrap`, `/categorizer/batch`, `/categorizer/classify/{guid}`
+  - **Category CRUD**: `GET/POST/PUT/DELETE /categorizer/categories` -- manage categories per workspace
   - 7 new environment variables (`CATEGORIZER_ENABLED`, `LLM_API_URL`, etc.)
   - Gated by `CATEGORIZER_ENABLED=false` (default off)
+- **Document chunking**: full-content semantic search via `doc_chunks` table
+  - Documents split into overlapping chunks, each with its own embedding
+  - Improves search recall for long documents
 - **Built-in Web UI** served at `/ui/`
-  - Search page (`index.html`): semantic search, card grid, document panel with markdown
-  - Map page (`map.html`): Three.js galaxy/timeline visualization with particle clustering
+  - Search page (`/ui/`): semantic search, card grid, document panel with markdown
+  - Map page (`/ui/map.html`): Three.js galaxy/timeline visualization with particle clustering
+  - Settings page (`/ui/settings.html`): system status, workspace management, API keys, categorizer config with CRUD
   - Modular ES modules architecture (`js/map/*.js`, 15 modules, no build step)
   - Text search (TX) and semantic search (AI) with live timer and client-side cache
 - `/browse` endpoint: all documents with short previews for client-side search
 - `/keyword` endpoint: fast ILIKE search without embedding
 - `/summarize/{guid}` endpoint: on-demand LLM document summarization with DB caching
+- `/short/{guid}` endpoint: document summary in short form
+- `PUT /doc/{guid}` endpoint: update document content and tags
 - Server-side query embedding cache (1h TTL, 500 entries) to avoid repeated 20s CPU inference
-- `api-demo` service in docker-compose.yml for public demo instance
-- `scripts/generate_demo.py` and `scripts/enrich_demo_tags.py` dev utilities
 - **Demo seed data**: `examples/demo-seed.jsonl` with 1000 pre-generated documents across 15 categories
-  - 3 new categories: Design & UX, DevOps & SRE, Career & Management
-  - Tags pre-enriched (category, topic, project, status) -- no separate enrichment step needed
   - Auto-seeds on first startup when `ENVIRONMENT=demo` and database is empty
-- `scripts/seed_demo.py`: standalone JSONL loader for manual seeding
-- `generate_demo.py` now supports `--output` (write JSONL) and `--seed` (deterministic output) flags
+- `api-demo` service in docker-compose.yml for public demo instance
+- `scripts/seed_demo.py`, `scripts/generate_demo.py`, `scripts/enrich_demo_tags.py` dev utilities
+- `scripts/init-db.sh` for database initialization
 
 ### Changed
+- `category_centroids` table: composite PK `(category_id, workspace_id)` -- categories are per-workspace
 - docker-compose.yml: domain defaults changed to `example.com` placeholders (set real domains in `.env`)
 - `.dockerignore`: added `docker-compose*.yml`, `mcp_server.py`, `scripts/` to reduce build context
 
 ### Fixed
 - `.gitignore`: added `*.bak` pattern to prevent accidental backup commits
+- Chunk search limit and reindex resilience improvements
 
 ---
 

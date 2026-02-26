@@ -226,6 +226,45 @@ Setup:
 }
 ```
 
+### Workspaces (multi-tenancy)
+
+Isolate documents by workspace. Each workspace has its own documents, categories, and search index. Perfect for teams or multi-project setups.
+
+```bash
+# Save to a specific workspace
+curl -X PUT localhost:8000/ \
+  -H "Content-Type: application/json" \
+  -H "X-Workspace: marketing" \
+  -d '{"content": "Q1 campaign results...", "tags": ["type:note"]}'
+
+# Search only within that workspace
+curl -X POST localhost:8000/search \
+  -H "X-Workspace: marketing" \
+  -d '{"query": "campaign performance"}'
+```
+
+Without `X-Workspace`, everything goes to the `default` workspace. Fully backward-compatible.
+
+**Scoped API keys** restrict access to specific workspaces:
+
+```bash
+# Create a key that only sees "marketing" and "sales" workspaces
+curl -X POST localhost:8000/admin/keys \
+  -H "Content-Type: application/json" \
+  -d '{"label": "marketing-team", "workspaces": ["marketing", "sales"]}'
+```
+
+**Admin endpoints:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/admin/keys` | Create scoped API key |
+| `GET` | `/admin/keys` | List API keys |
+| `DELETE` | `/admin/keys/{hash}` | Revoke key |
+| `GET` | `/admin/workspaces` | List workspaces with doc counts |
+| `DELETE` | `/admin/workspaces/{name}` | Delete workspace and all docs |
+| `GET` | `/admin/config` | Server configuration |
+
 ### AI Categorizer (opt-in)
 
 Automatic document classification using an LLM. Disabled by default -- works without any external API keys.
@@ -265,20 +304,30 @@ curl localhost:8000/categorizer/taxonomy
 
 The bootstrap samples your documents, asks the LLM to propose meaningful categories (like "Infrastructure", "Product Decisions", "Research Notes"), then classifies every document. New documents are classified automatically as they arrive.
 
-**Use your own categories:**
+**Manage categories manually:**
 
-You can also define a custom taxonomy by saving it as a document:
+Categories are workspace-scoped. Each workspace gets its own taxonomy.
 
 ```bash
-curl -X PUT localhost:8000/ \
-  -H "Content-Type: application/json" \
-  -d '{
-    "content": "{\"version\": 1, \"categories\": [{\"id\": \"engineering\", \"name\": \"Engineering\", \"description\": \"Code, architecture, debugging\"}, {\"id\": \"product\", \"name\": \"Product\", \"description\": \"Features, roadmap, user feedback\"}, {\"id\": \"operations\", \"name\": \"Operations\", \"description\": \"Deployments, monitoring, incidents\"}]}",
-    "tags": ["type:taxonomy", "topic:ai-categorizer", "status:active"]
-  }'
-```
+# List categories for a workspace
+curl localhost:8000/categorizer/categories -H "X-Workspace: marketing"
 
-After saving, restart the service or call `POST /categorizer/bootstrap` to apply. The Galaxy Map visualization uses these categories to create clusters.
+# Create a custom category
+curl -X POST localhost:8000/categorizer/categories \
+  -H "Content-Type: application/json" \
+  -H "X-Workspace: marketing" \
+  -d '{"id": "campaigns", "name": "Campaigns", "description": "Marketing campaigns"}'
+
+# Rename a category
+curl -X PUT localhost:8000/categorizer/categories/campaigns \
+  -H "Content-Type: application/json" \
+  -H "X-Workspace: marketing" \
+  -d '{"name": "Ad Campaigns"}'
+
+# Delete a category (also removes its tags from documents)
+curl -X DELETE localhost:8000/categorizer/categories/campaigns \
+  -H "X-Workspace: marketing"
+```
 
 **Classify existing documents in bulk:**
 
@@ -305,34 +354,84 @@ curl -X PUT localhost:8000/bulk \
 
 ## API Reference
 
+All endpoints accept `X-Workspace` header to select workspace (default: `default`).
+
+**Documents:**
+
 | Method | Path | Description |
 |--------|------|-------------|
 | `PUT` | `/` | Create document |
 | `GET` | `/` | Help (no params) or list documents (with params) |
 | `POST` | `/search` | Semantic search |
 | `GET` | `/{guid}` | Get document |
-| `PATCH` | `/{guid}` | Update document |
+| `PUT` | `/doc/{guid}` | Update document |
+| `PATCH` | `/{guid}` | Update document (alias) |
 | `DELETE` | `/{guid}` | Delete document |
 | `PUT` | `/bulk` | Bulk create (up to 100) |
 | `GET` | `/versions/{guid}` | Version chain |
-| `GET` | `/tags` | All tags with counts |
-| `GET` | `/stats` | Statistics |
-| `GET` | `/health` | Health check |
-| `GET` | `/schema` | Tag schema |
+| `GET` | `/short/{guid}` | Short document summary |
 | `GET` | `/browse` | All documents (for client-side search) |
 | `GET` | `/keyword` | Fast keyword search (no embedding) |
-| `PUT` | `/meta/{guid}` | Document metadata (JSONB) |
+| `GET` | `/by-hash/{hash}` | Find document by content hash |
+| `PATCH` | `/by-hash` | Update document by content hash |
+
+**Search & Discovery:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/tags` | All tags with counts |
+| `GET` | `/stats` | Statistics |
+| `GET` | `/activity` | Document activity feed |
+| `GET` | `/schema` | Tag schema |
+| `GET` | `/visualize` | Visualization data for galaxy map |
+
+**Metadata:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `PUT` | `/meta/{guid}` | Set document metadata (JSONB) |
 | `GET` | `/meta/{guid}` | Get document metadata |
 | `DELETE` | `/meta/{guid}` | Delete document metadata |
 | `GET` | `/meta?type=` | List metadata by document type |
+
+**Embeddings:**
+
+| Method | Path | Description |
+|--------|------|-------------|
 | `POST` | `/embed` | Generate embedding for text |
 | `POST` | `/embed/batch` | Batch embed multiple texts |
-| `GET` | `/activity` | Document activity feed |
-| `GET` | `/by-hash/{hash}` | Find document by content hash |
-| `PATCH` | `/by-hash` | Update document by content hash |
+
+**AI Categorizer** (requires `CATEGORIZER_ENABLED=true`):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/categorizer/taxonomy` | Current taxonomy with stats |
+| `POST` | `/categorizer/bootstrap` | Generate taxonomy from documents |
+| `POST` | `/categorizer/batch` | Batch classify untagged documents |
+| `POST` | `/categorizer/classify/{guid}` | Classify single document |
+| `GET` | `/categorizer/categories` | List categories (workspace-scoped) |
+| `POST` | `/categorizer/categories` | Create category (admin) |
+| `PUT` | `/categorizer/categories/{id}` | Rename category (admin) |
+| `DELETE` | `/categorizer/categories/{id}` | Delete category (admin) |
+
+**AI & Utilities:**
+
+| Method | Path | Description |
+|--------|------|-------------|
 | `POST` | `/summarize/{guid}` | AI-powered document summary |
-| `GET` | `/visualize` | Visualization data for galaxy map |
+| `GET` | `/health` | Health check |
 | `GET` | `/help` | Full API documentation |
+
+**Admin** (requires admin API key):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/admin/keys` | Create scoped API key |
+| `GET` | `/admin/keys` | List API keys |
+| `DELETE` | `/admin/keys/{hash}` | Revoke API key |
+| `GET` | `/admin/workspaces` | List workspaces |
+| `DELETE` | `/admin/workspaces/{name}` | Delete workspace |
+| `GET` | `/admin/config` | Server configuration |
 
 Full endpoint details: [docs/api-reference.md](docs/api-reference.md)
 
@@ -340,27 +439,28 @@ Full endpoint details: [docs/api-reference.md](docs/api-reference.md)
 
 ```
 +--------------+  +--------------+  +--------------+
-|  CLI / curl  |  |  MCP Server  |  |  Web / Apps  |
+|  CLI / curl  |  |  MCP Server  |  |  Web UI /ui/ |
 +------+-------+  +------+-------+  +------+-------+
        |                 |                 |
-       +-----------------+-----------------+
+       +-------  X-Workspace header -------+
                          |
               +----------v----------+
               |  Mesh API (FastAPI) |
               |  localhost:8000     |
               |                     |
-              |  +---------------+  |
-              |  |  Tag Schema   |  |  mesh.yaml
-              |  |  (defaults,   |  |  auto-tagging
-              |  |   inference)  |  |  validation
-              |  +---------------+  |
+              |  +--- Auth + RLS --+|  API keys, workspace isolation
+              |  +-- Tag Schema ---+|  mesh.yaml, auto-tagging
+              |  +-- Categorizer --+|  per-workspace taxonomy
               +----------+----------+
                          |
               +----------v--------------+
               |  PostgreSQL + pgvector  |
-              |  +- documents          |
+              |  +- documents          |  workspace_id + RLS
               |  +- doc_embeddings     |  768-dim vectors
+              |  +- doc_chunks         |  chunked embeddings
+              |  +- category_centroids |  per-workspace categories
               |  +- document_metadata  |  JSONB
+              |  +- api_keys           |  scoped access
               +-----------+------------+
 ```
 
@@ -394,11 +494,13 @@ docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d
 ```bash
 # Core
 DATABASE_URL=postgresql://postgres:password@postgres:5432/meshdb
+DATABASE_URL_APP=postgresql://mesh_app:apppass@postgres:5432/meshdb  # RLS-enforced pool
+MESH_APP_PASSWORD=apppass     # Password for mesh_app role (RLS)
 EMBEDDING_MODEL=intfloat/multilingual-e5-base
 
 # Security
 AUTH_REQUIRED=false           # Require X-API-Key header
-API_KEYS=key1,key2            # Valid API keys
+API_KEYS=key1,key2            # Valid admin API keys
 IP_WHITELIST=                 # CIDR ranges (empty = allow all)
 CORS_ORIGINS=                 # Allowed origins
 
@@ -450,17 +552,32 @@ Mesh is designed for personal and team knowledge management -- not for billion-s
 
 ```
 mesh/                     # Python package (FastAPI app)
-  main.py                 # Application + auto-tagging + version chains
+  main.py                 # Application, auth, auto-tagging, version chains
   crud.py                 # Document CRUD + search
+  database.py             # Schema migrations + RLS setup
   embeddings.py           # Embedding generation
+  chunker.py              # Document chunking for full-content search
+  config.py               # Environment configuration
   tag_schema.py           # Tag schema + auto-inference
   mesh.yaml               # Tag configuration
-  categorizer/            # AI classification (opt-in)
-ui/                       # Built-in web UI (search + galaxy map)
+  categorizer/            # AI classification (opt-in, workspace-scoped)
+    __init__.py            # Core: classify, bootstrap, batch_scan
+    taxonomy.py            # TaxonomyStore (per-workspace)
+    router.py              # API endpoints + CRUD
+    models.py              # Pydantic models
+    classifier_embedding.py
+    classifier_llm.py
+    config.py
+ui/                       # Built-in web UI
+  index.html              # Search page
+  map.html                # Galaxy/timeline visualization
+  settings.html           # Admin: workspaces, API keys, categorizer
+  js/map/                 # Three.js modules (15 files)
 scripts/                  # Dev utilities
-  generate_demo.py        # Generate demo data (--output JSONL, --seed)
+  generate_demo.py        # Generate demo data
   seed_demo.py            # Load JSONL into Mesh via API
-  enrich_demo_tags.py     # Tag enrichment rules
+  reindex_chunks.py       # Reindex document chunks
+  init-db.sh              # Database initialization
 examples/                 # Usage examples + demo seed data
   demo-seed.jsonl         # 1000 pre-generated documents
 mcp_server.py             # MCP server (12 tools)
