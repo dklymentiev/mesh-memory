@@ -18,7 +18,7 @@ export const CAT_PALETTE = [
   '#f06292','#7986cb','#a1887f','#90a4ae','#dce775'
 ];
 
-export const SKIP_RE = /^(type|date|source|session|agent|status|dacs-folder|guid|project|ai-category|ai-subcategory):/;
+export const SKIP_RE = /^(type|date|source|session|agent|status|doci-folder|guid|project|ai-category|ai-subcategory):/;
 
 export const TRANSITION_MS = 1200;
 export const SEARCH_TRANS_MS = 800;

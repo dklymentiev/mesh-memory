@@ -54,7 +54,7 @@ export function getCatName(catId) {
 }
 
 export function extractTagLabel(t) {
-  if (t.startsWith('dacs-path:')) return t.split('/').pop().replace(/\.md$/, '');
+  if (t.startsWith('doci-path:')) return t.split('/').pop().replace(/\.md$/, '');
   if (t.startsWith('topic:')) return t.slice(6);
   if (t.includes(':')) return t.split(':').slice(1).join(':');
   return t;
