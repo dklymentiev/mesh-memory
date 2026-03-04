@@ -1072,6 +1072,21 @@ async def root_endpoint(
                     "description": "Full API documentation (this help)"
                 }
             },
+            "workspaces": {
+                "description": "Workspaces provide isolated document spaces. Each workspace has its own documents, tags, and search index. Documents in one workspace are invisible to others.",
+                "header": "X-Workspace: workspace-name",
+                "default": "If no header is sent, documents go to the 'default' workspace.",
+                "auto_created": "Workspaces are created automatically on first document save -- no setup needed.",
+                "examples": {
+                    "create_in_workspace": "curl -X PUT $API_URL/ -H 'Content-Type: application/json' -H 'X-Workspace: my-agent' -d '{\"content\":\"text\",\"tags\":[\"type:note\"]}'",
+                    "search_in_workspace": "curl -X POST $API_URL/search -H 'Content-Type: application/json' -H 'X-Workspace: my-agent' -d '{\"query\":\"find this\",\"limit\":5}'",
+                    "list_in_workspace": "curl '$API_URL/?limit=10' -H 'X-Workspace: my-agent'"
+                },
+                "admin": {
+                    "list_workspaces": "GET /admin/workspaces - list all workspaces with document counts",
+                    "delete_workspace": "DELETE /admin/workspaces/{name} - delete workspace and all its documents"
+                }
+            },
             "curl_examples": {
                 "create": "curl -X PUT $API_URL/ -H 'Content-Type: application/json' -d '{\"content\":\"My note\",\"tags\":[\"type:note\",\"date:2025-12-30\"]}'",
                 "search": "curl -X POST $API_URL/search -H 'Content-Type: application/json' -d '{\"query\":\"PostgreSQL optimization\",\"limit\":3}'",
