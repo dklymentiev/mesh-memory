@@ -39,7 +39,7 @@ from .config import (
     get_database_url, get_app_database_url, get_app_role_password,
     get_similarity_threshold, get_ip_whitelist,
     get_cors_origins, is_debug_enabled, get_rate_limit_search,
-    get_rate_limit_embed, is_auth_required, get_api_keys,
+    get_rate_limit_embed, get_rate_limit_heavy, is_auth_required, get_api_keys,
     get_db_pool_min_size, get_db_pool_max_size, get_log_level,
     get_max_content_length, get_embedding_model_name, verify_baked_model
 )
@@ -111,7 +111,7 @@ class RateLimiter:
 
 _search_limiter = RateLimiter(get_rate_limit_search())
 _embed_limiter = RateLimiter(get_rate_limit_embed())
-_heavy_limiter = RateLimiter(10)  # 10 req/min for CPU-intensive endpoints
+_heavy_limiter = RateLimiter(get_rate_limit_heavy())
 
 
 def _get_client_ip(request: Request) -> str:

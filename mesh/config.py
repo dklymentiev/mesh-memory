@@ -133,6 +133,10 @@ def get_rate_limit_embed() -> int:
     """Max requests per minute for /embed endpoints (0 = unlimited)"""
     return int(os.getenv("RATE_LIMIT_EMBED", "30"))
 
+def get_rate_limit_heavy() -> int:
+    """Max requests per minute for CPU-intensive endpoints like /bulk, create, delete (0 = unlimited)"""
+    return int(os.getenv("RATE_LIMIT_HEAVY", "30"))
+
 def trust_proxy_headers() -> bool:
     """Whether to trust proxy headers (CF-Connecting-IP, X-Real-IP) for client IP.
     MUST be set to true only when behind a trusted reverse proxy (Cloudflare, Traefik).
