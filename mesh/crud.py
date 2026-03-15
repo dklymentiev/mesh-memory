@@ -71,20 +71,30 @@ class DocumentCRUD:
                     content_hash
                 )
                 if existing:
-                    logger.info(f"Dedup: content_hash {content_hash} already exists as {existing['guid']}, skipping")
-                    # Return existing document info
+                    logger.info(f"Dedup: content_hash {content_hash} already exists as {existing['guid']}, merging tags")
+                    # Merge new tags into existing document
                     row = await conn.fetchrow(
                         "SELECT * FROM documents WHERE guid = $1", existing['guid']
                     )
+                    existing_tags = list(row['tags']) if row['tags'] else []
+                    merged_tags = list(existing_tags)
+                    for tag in tags:
+                        if tag not in merged_tags:
+                            merged_tags.append(tag)
+                    if merged_tags != existing_tags:
+                        await conn.execute(
+                            "UPDATE documents SET tags = $1, updated_at = $2 WHERE guid = $3",
+                            merged_tags, now, existing['guid']
+                        )
                     return DocumentResponse(
                         guid=row['guid'],
                         content=row['content'],
                         content_hash=row['content_hash'],
                         filename=row.get('filename'),
                         source=row.get('source', 'api'),
-                        tags=list(row['tags']) if row['tags'] else [],
+                        tags=merged_tags,
                         created_at=row['created_at'],
-                        updated_at=row['updated_at'],
+                        updated_at=now,
                         directory="inbox",
                         workspace=row.get('workspace_id', 'default')
                     )
@@ -310,45 +320,64 @@ class EmbeddingCRUD:
         query_embedding: List[float],
         limit: int = 10,
         similarity_threshold: float = 0.0,
-        tags: Optional[List[str]] = None
+        tags: Optional[List[str]] = None,
+        date_from: Optional['datetime'] = None,
+        date_to: Optional['datetime'] = None
     ) -> List[Tuple[str, float]]:
         """Search for similar documents using cosine similarity.
 
         Args:
             tags: If provided, only return documents containing ALL of these tags
                   (PostgreSQL array @> operator).
+            date_from: If provided, only return documents created on or after this date.
+            date_to: If provided, only return documents created on or before this date.
         """
         async with self._conn() as conn:
             try:
                 query_vector = '[' + ','.join(map(str, query_embedding)) + ']'
+                needs_join = tags or date_from or date_to
 
-                if tags:
-                    rows = await conn.fetch(
-                        """
+                # Build dynamic WHERE clauses and params
+                conditions = ["1 - (e.embedding <=> $1::vector) >= $2"]
+                params = [query_vector, similarity_threshold, limit]
+                idx = 4
+
+                if needs_join:
+                    if tags:
+                        conditions.append(f"d.tags @> ${idx}::text[]")
+                        params.append(tags)
+                        idx += 1
+                    if date_from:
+                        conditions.append(f"d.created_at >= ${idx}")
+                        params.append(date_from)
+                        idx += 1
+                    if date_to:
+                        conditions.append(f"d.created_at <= ${idx}")
+                        params.append(date_to)
+                        idx += 1
+
+                    where_clause = " AND ".join(conditions)
+                    query = f"""
                         SELECT e.guid,
                                1 - (e.embedding <=> $1::vector) AS similarity_score
                         FROM doc_embeddings e
                         JOIN documents d ON d.guid = e.guid
-                        WHERE 1 - (e.embedding <=> $1::vector) >= $2
-                          AND d.tags @> $4::text[]
+                        WHERE {where_clause}
                         ORDER BY similarity_score DESC
                         LIMIT $3
-                        """,
-                        query_vector, similarity_threshold, limit, tags
-                    )
+                    """
                 else:
-                    rows = await conn.fetch(
-                        """
+                    where_clause = " AND ".join(conditions)
+                    query = f"""
                         SELECT e.guid,
                                1 - (e.embedding <=> $1::vector) AS similarity_score
                         FROM doc_embeddings e
-                        WHERE 1 - (e.embedding <=> $1::vector) >= $2
+                        WHERE {where_clause}
                         ORDER BY similarity_score DESC
                         LIMIT $3
-                        """,
-                        query_vector, similarity_threshold, limit
-                    )
+                    """
 
+                rows = await conn.fetch(query, *params)
                 return [(row['guid'], float(row['similarity_score'])) for row in rows]
 
             except Exception as e:
@@ -360,7 +389,9 @@ class EmbeddingCRUD:
         query_embedding: List[float],
         limit: int = 10,
         similarity_threshold: float = 0.0,
-        tags: Optional[List[str]] = None
+        tags: Optional[List[str]] = None,
+        date_from: Optional['datetime'] = None,
+        date_to: Optional['datetime'] = None
     ) -> List[Tuple[str, float]]:
         """Search for similar documents via chunk-level embeddings.
 
@@ -370,29 +401,49 @@ class EmbeddingCRUD:
         async with self._conn() as conn:
             try:
                 query_vector = '[' + ','.join(map(str, query_embedding)) + ']'
-                # Fetch more chunks than needed to ensure enough unique docs
-                # (a single doc with 20 chunks can dominate the top-N)
                 chunk_limit = limit * 10
+                needs_filters = tags or date_from or date_to
 
-                if tags:
+                if needs_filters:
+                    # Build inner WHERE conditions
+                    inner_conditions = []
+                    params = [query_vector, similarity_threshold, chunk_limit]
+                    idx = 4
+
+                    if tags:
+                        inner_conditions.append(f"d.tags @> ${idx}::text[]")
+                        params.append(tags)
+                        idx += 1
+                    if date_from:
+                        inner_conditions.append(f"d.created_at >= ${idx}")
+                        params.append(date_from)
+                        idx += 1
+                    if date_to:
+                        inner_conditions.append(f"d.created_at <= ${idx}")
+                        params.append(date_to)
+                        idx += 1
+
+                    params.append(limit)
+                    inner_where = " AND ".join(inner_conditions)
+
                     rows = await conn.fetch(
-                        """
+                        f"""
                         SELECT guid, MAX(sim) AS similarity_score
                         FROM (
                             SELECT c.guid,
                                    1 - (c.embedding <=> $1::vector) AS sim
                             FROM doc_chunks c
                             JOIN documents d ON d.guid = c.guid
-                            WHERE d.tags @> $4::text[]
+                            WHERE {inner_where}
                             ORDER BY c.embedding <=> $1::vector
                             LIMIT $3
                         ) sub
                         WHERE sim >= $2
                         GROUP BY guid
                         ORDER BY similarity_score DESC
-                        LIMIT $5
+                        LIMIT ${idx}
                         """,
-                        query_vector, similarity_threshold, chunk_limit, tags, limit
+                        *params
                     )
                 else:
                     rows = await conn.fetch(

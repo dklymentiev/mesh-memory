@@ -1340,14 +1340,18 @@ async def search_documents(request: SearchRequest, auth: AuthContext = Depends(r
                 query_embedding=query_embedding,
                 limit=limit,
                 similarity_threshold=get_similarity_threshold(),
-                tags=request.tags
+                tags=request.tags,
+                date_from=request.date_from,
+                date_to=request.date_to
             )
         else:
             similar_docs = await scoped_emb.search_similar_documents(
                 query_embedding=query_embedding,
                 limit=limit,
                 similarity_threshold=get_similarity_threshold(),
-                tags=request.tags
+                tags=request.tags,
+                date_from=request.date_from,
+                date_to=request.date_to
             )
 
         # Build results from semantic search (batch fetch to avoid N+1)
@@ -1370,6 +1374,7 @@ async def search_documents(request: SearchRequest, auth: AuthContext = Depends(r
                     content=row['content'],
                     tags=list(row['tags']) if row['tags'] else [],
                     created_at=row['created_at'],
+                    updated_at=row.get('updated_at'),
                     similarity_score=round(score_map[g], 3),
                     directory="inbox",
                     workspace=row.get('workspace_id', 'default')
@@ -1392,6 +1397,12 @@ async def search_documents(request: SearchRequest, auth: AuthContext = Depends(r
             keyword_hits = []
             for doc in keyword_results:
                 if doc.guid not in seen_guids:
+                    # Apply date filters to keyword results too
+                    doc_dt = doc.created_at.replace(tzinfo=None) if doc.created_at else None
+                    if request.date_from and doc_dt and doc_dt < request.date_from.replace(tzinfo=None):
+                        continue
+                    if request.date_to and doc_dt and doc_dt > request.date_to.replace(tzinfo=None):
+                        continue
                     keyword_hits.append(SearchResult(
                         guid=doc.guid,
                         content=doc.content,
@@ -1566,6 +1577,17 @@ async def get_stats(auth: AuthContext = Depends(resolve_auth)):
                 "SELECT MAX(created_at) FROM documents"
             )
 
+        # Workspace summary (counts only, no content exposed)
+        async with migration_pool.acquire() as pool_conn:
+            workspace_rows = await pool_conn.fetch("""
+                SELECT workspace_id,
+                       COUNT(*) as doc_count,
+                       MAX(updated_at) as last_activity
+                FROM documents
+                GROUP BY workspace_id
+                ORDER BY doc_count DESC
+            """)
+
         return {
             "documents": doc_count,
             "indexed": emb_count,
@@ -1573,7 +1595,16 @@ async def get_stats(auth: AuthContext = Depends(resolve_auth)):
             "projects": project_count or 0,
             "tags": tag_count or 0,
             "queue_size": embedding_queue.qsize() if embedding_queue else 0,
-            "last_update": last_update.isoformat() if last_update else None
+            "last_update": last_update.isoformat() if last_update else None,
+            "workspaces": [
+                {
+                    "workspace": row["workspace_id"],
+                    "documents": row["doc_count"],
+                    "last_activity": row["last_activity"].isoformat()
+                    if row["last_activity"] else None,
+                }
+                for row in workspace_rows
+            ],
         }
     except Exception as e:
         logger.error(f"Stats failed: {e}")

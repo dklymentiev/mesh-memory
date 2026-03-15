@@ -378,15 +378,22 @@ async def mesh_projects(limit: int = 30, workspace: str | None = None) -> str:
 async def mesh_stats(workspace: str | None = None) -> str:
     """Get Mesh memory statistics."""
     data = await _get("/stats", workspace=workspace)
-    return (
-        f"Documents: {data.get('documents', 0)}\n"
-        f"Indexed: {data.get('indexed', 0)}\n"
-        f"Pending: {data.get('pending', 0)}\n"
-        f"Projects: {data.get('projects', 0)}\n"
-        f"Tags: {data.get('tags', 0)}\n"
-        f"Queue: {data.get('queue_size', 0)}\n"
-        f"Last update: {data.get('last_update', '?')}"
-    )
+    lines = [
+        f"Documents: {data.get('documents', 0)}",
+        f"Indexed: {data.get('indexed', 0)}",
+        f"Pending: {data.get('pending', 0)}",
+        f"Projects: {data.get('projects', 0)}",
+        f"Tags: {data.get('tags', 0)}",
+        f"Queue: {data.get('queue_size', 0)}",
+        f"Last update: {data.get('last_update', '?')}",
+    ]
+    workspaces = data.get("workspaces", [])
+    if workspaces:
+        lines.append(f"\nWorkspaces ({len(workspaces)}):")
+        for ws in workspaces:
+            last = (ws.get("last_activity") or "?")[:10]
+            lines.append(f"  {ws['workspace']}  ({ws['documents']} docs, last: {last})")
+    return "\n".join(lines)
 
 
 @mcp.tool()

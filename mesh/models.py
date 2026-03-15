@@ -44,6 +44,8 @@ class SearchRequest(BaseModel):
     query: str = Field(..., description="Search query", min_length=1)
     limit: Optional[int] = Field(default=10, description="Maximum number of results", ge=1, le=100)
     tags: Optional[List[str]] = Field(default=None, description="Filter results to documents containing ALL of these tags")
+    date_from: Optional[datetime] = Field(default=None, description="Only return documents created on or after this date")
+    date_to: Optional[datetime] = Field(default=None, description="Only return documents created on or before this date")
 
 class SearchResult(BaseModel):
     """Individual search result"""
@@ -51,6 +53,7 @@ class SearchResult(BaseModel):
     content: str = Field(..., description="Document content")
     tags: List[str] = Field(..., description="Document tags")
     created_at: datetime = Field(..., description="Document creation timestamp")
+    updated_at: Optional[datetime] = Field(default=None, description="Last update timestamp")
     similarity_score: float = Field(..., description="Similarity score (0-1)")
     directory: str = Field(..., description="Document directory")
     workspace: str = Field(default="default", description="Workspace ID")
