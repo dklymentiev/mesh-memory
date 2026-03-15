@@ -422,6 +422,21 @@ class TestStats:
         body = (await client.get("/stats")).json()
         assert body["documents"] == 0
 
+    @pytest.mark.asyncio
+    async def test_stats_has_workspaces_key(self, client):
+        body = (await client.get("/stats")).json()
+        assert "workspaces" in body
+        assert isinstance(body["workspaces"], list)
+
+    @pytest.mark.asyncio
+    async def test_stats_workspaces_have_required_fields(self, client):
+        await _create_doc(client)
+        body = (await client.get("/stats")).json()
+        for ws in body["workspaces"]:
+            assert "workspace" in ws
+            assert "documents" in ws
+            assert "last_activity" in ws
+
 
 # ---------------------------------------------------------------------------
 # Upsert with explicit GUID  PUT /doc/{guid}
@@ -509,49 +524,49 @@ class TestPatchDocument:
 
 class TestUtils:
     def test_generate_guid_format(self):
-        from utils import generate_document_guid, validate_document_guid
+        from mesh.utils import generate_document_guid, validate_document_guid
         guid = generate_document_guid()
         assert guid.startswith("doc_")
         assert len(guid) == 20
         assert validate_document_guid(guid)
 
     def test_validate_guid_rejects_bad_format(self):
-        from utils import validate_document_guid
+        from mesh.utils import validate_document_guid
         assert not validate_document_guid("bad-guid")
         assert not validate_document_guid("doc_ZZZZZZZZ")  # non-hex
         assert not validate_document_guid("doc_123")        # too short
         assert not validate_document_guid("")
 
     def test_normalize_tags_lowercases(self):
-        from utils import normalize_tags
+        from mesh.utils import normalize_tags
         assert normalize_tags(["FOO", "Bar", "BAZ"]) == ["foo", "bar", "baz"]
 
     def test_normalize_tags_deduplicates(self):
-        from utils import normalize_tags
+        from mesh.utils import normalize_tags
         assert normalize_tags(["a", "b", "a", "c", "b"]) == ["a", "b", "c"]
 
     def test_normalize_tags_strips_whitespace(self):
-        from utils import normalize_tags
+        from mesh.utils import normalize_tags
         result = normalize_tags(["  hello  ", "  world"])
         assert "hello" in result
         assert "world" in result
 
     def test_normalize_tags_removes_empty(self):
-        from utils import normalize_tags
+        from mesh.utils import normalize_tags
         assert normalize_tags(["", "  ", "valid"]) == ["valid"]
 
     def test_normalize_tags_none_input(self):
-        from utils import normalize_tags
+        from mesh.utils import normalize_tags
         assert normalize_tags(None) == []
 
     def test_normalize_tags_strips_duplicates_after_lowercasing(self):
-        from utils import normalize_tags
+        from mesh.utils import normalize_tags
         # "FOO" and "foo" should become one entry after normalization
         result = normalize_tags(["FOO", "foo", "bar"])
         assert result.count("foo") == 1
 
     def test_compute_content_hash(self):
-        from crud import compute_content_hash
+        from mesh.crud import compute_content_hash
         h1 = compute_content_hash("hello world")
         h2 = compute_content_hash("hello world")
         h3 = compute_content_hash("different content")
@@ -560,7 +575,7 @@ class TestUtils:
         assert len(h1) == 32     # MD5 hex is 32 chars
 
     def test_validate_guid_accepts_valid_format(self):
-        from utils import validate_document_guid
+        from mesh.utils import validate_document_guid
         assert validate_document_guid("doc_12345678")
         assert validate_document_guid("doc_abcdef01")
         assert validate_document_guid("doc_00000000")
@@ -854,7 +869,7 @@ class TestSchemaValidation:
 
     def test_create_table_has_all_crud_columns(self):
         """Ensure CREATE TABLE in database.py defines all columns used by CRUD INSERT."""
-        import database
+        import mesh.database as database
         import inspect
 
         # Get the source of create_tables
@@ -884,7 +899,7 @@ class TestSchemaValidation:
 
     def test_migration_adds_missing_columns(self):
         """Ensure ALTER TABLE migrations cover all columns not in original schema."""
-        import database
+        import mesh.database as database
         import inspect
 
         source = inspect.getsource(database.create_tables)
@@ -916,7 +931,7 @@ class TestSchemaValidation:
             "intfloat/multilingual-e5-large": 1024,
         }
 
-        import database
+        import mesh.database as database
         import inspect, re
         db_source = inspect.getsource(database.create_tables)
         dim_match = re.search(r"vector\((\d+)\)", db_source)
