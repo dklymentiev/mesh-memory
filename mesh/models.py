@@ -38,6 +38,7 @@ class DocumentResponse(BaseModel):
     updated_at: Optional[datetime] = Field(default=None, description="Last update timestamp")
     directory: str = Field(..., description="Assigned directory path")
     workspace: str = Field(default="default", description="Workspace ID")
+    pinned: bool = Field(default=False, description="Pinned to top of workspace")
 
 class SearchRequest(BaseModel):
     """Request model for semantic search"""

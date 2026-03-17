@@ -136,6 +136,46 @@ mcp = FastMCP(
 # ──────────────────────────────────────────
 
 @mcp.tool()
+async def mesh_focus(workspace: str, prefetch: bool = True, limit: int = 5) -> str:
+    """Switch active workspace. All subsequent calls use this workspace by default.
+
+    Optionally prefetches recent documents for immediate context.
+
+    Args:
+        workspace: Workspace name to switch to (e.g. "hq-architect", "default")
+        prefetch: Load recent documents after switching (default True)
+        limit: How many recent docs to prefetch (default 5)
+    """
+    global MESH_WORKSPACE
+    previous = MESH_WORKSPACE or "(none)"
+    MESH_WORKSPACE = workspace
+
+    lines = [f"Workspace: {previous} -> {workspace}"]
+
+    if prefetch:
+        try:
+            body = {"query": workspace, "limit": limit}
+            resp = await _post("/search", body, workspace=workspace)
+            docs = resp.get("results", []) if isinstance(resp, dict) else resp if isinstance(resp, list) else []
+            if docs:
+                lines.append(f"\nRecent {len(docs)} documents in '{workspace}':\n")
+                for doc in docs:
+                    guid = doc.get("guid", "?")
+                    tags_str = ", ".join(doc.get("tags", []))
+                    preview = (doc.get("content", ""))[:120]
+                    created = doc.get("created_at", "")[:10] if doc.get("created_at") else ""
+                    lines.append(f"**{guid}** ({created}) [{tags_str}]")
+                    lines.append(f"  {preview}")
+                    lines.append("")
+            else:
+                lines.append(f"\nWorkspace '{workspace}' is empty.")
+        except Exception as e:
+            lines.append(f"\nPrefetch failed: {e}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def mesh_search(query: str, limit: int = 10, tags: list[str] | None = None,
                       workspace: str | None = None) -> str:
     """Semantic search across all documents in Mesh memory.
@@ -202,6 +242,7 @@ async def mesh_update(
     tags: list[str] | None = None,
     add_tags: list[str] | None = None,
     remove_tags: list[str] | None = None,
+    pinned: bool | None = None,
     workspace: str | None = None,
 ) -> str:
     """Update an existing document's content or tags.
@@ -212,6 +253,7 @@ async def mesh_update(
         tags: Replace all tags with these
         add_tags: Add tags to existing
         remove_tags: Remove tags from existing
+        pinned: Pin document to top of workspace (True/False)
         workspace: Target workspace (uses default if not set)
     """
     body = {}
@@ -223,8 +265,10 @@ async def mesh_update(
         body["add_tags"] = add_tags
     if remove_tags is not None:
         body["remove_tags"] = remove_tags
+    if pinned is not None:
+        body["pinned"] = pinned
     if not body:
-        return "Nothing to update. Provide content, tags, add_tags, or remove_tags."
+        return "Nothing to update. Provide content, tags, add_tags, remove_tags, or pinned."
     data = await _patch(f"/{guid}", body, workspace=workspace)
     updated = data.get("updated_fields", [])
     final_tags = data.get("tags", [])
@@ -406,7 +450,7 @@ async def mesh_recent(limit: int = 10, type: str | None = None,
         type: Optional type filter (worklog, note, artifact, etc.)
         workspace: Target workspace (uses default if not set)
     """
-    params = {"limit": limit}
+    params = {"limit": limit, "all": "true"}
     if type:
         params["tag"] = f"type:{type}"
     data = await _get("/", params, workspace=workspace)

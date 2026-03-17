@@ -47,6 +47,11 @@ async def create_tables(pool: asyncpg.Pool) -> None:
             ALTER TABLE documents ADD COLUMN IF NOT EXISTS summary TEXT DEFAULT NULL
         """)
 
+        # Pinned documents feature (#611)
+        await conn.execute("""
+            ALTER TABLE documents ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE
+        """)
+
         # Create index on content_hash for fast lookup
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS documents_content_hash_idx

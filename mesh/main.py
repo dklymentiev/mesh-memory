@@ -1148,7 +1148,7 @@ async def root_endpoint(
                 # Filter by ALL tags (AND logic)
                 query = """
                     SELECT guid, content, content_hash, filename, source,
-                           tags, created_at, updated_at
+                           tags, created_at, updated_at, pinned
                     FROM documents
                     WHERE """
 
@@ -1159,7 +1159,7 @@ async def root_endpoint(
                     query += f"${ i + 1 }::text = ANY(tags)"
 
                 query += f"""
-                    ORDER BY created_at DESC
+                    ORDER BY pinned DESC, created_at DESC
                     LIMIT ${len(filter_tags) + 1} OFFSET ${len(filter_tags) + 2}
                 """
 
@@ -1168,9 +1168,9 @@ async def root_endpoint(
                 # No filters - return recent documents
                 rows = await conn.fetch("""
                     SELECT guid, content, content_hash, filename, source,
-                           tags, created_at, updated_at
+                           tags, created_at, updated_at, pinned
                     FROM documents
-                    ORDER BY created_at DESC
+                    ORDER BY pinned DESC, created_at DESC
                     LIMIT $1 OFFSET $2
                 """, limit, offset)
 
@@ -1185,7 +1185,8 @@ async def root_endpoint(
                     created_at=row['created_at'],
                     updated_at=row['updated_at'],
                     directory="inbox",
-                    workspace=row.get('workspace_id', 'default') if 'workspace_id' in row.keys() else auth.workspace
+                    workspace=row.get('workspace_id', 'default') if 'workspace_id' in row.keys() else auth.workspace,
+                    pinned=row.get('pinned', False) if 'pinned' in row.keys() else False
                 )
                 for row in rows
             ]
@@ -1844,6 +1845,7 @@ class DocumentUpdateRequest(BaseModel):
     tags: Optional[List[str]] = None
     add_tags: Optional[List[str]] = None  # Add to existing tags
     remove_tags: Optional[List[str]] = None  # Remove from existing tags
+    pinned: Optional[bool] = None  # Pin document to top of workspace
 
 @app.patch("/by-hash", dependencies=[Depends(check_heavy_rate_limit)])
 async def update_document_by_hash(request: HashUpdateRequest, auth: AuthContext = Depends(resolve_auth)):
@@ -1992,6 +1994,12 @@ async def update_document(guid: str, request: DocumentUpdateRequest,
             if request.tags is not None or request.add_tags or request.remove_tags:
                 updates.append(f"tags = ${param_idx}")
                 params.append(current_tags)
+                param_idx += 1
+
+            # Update pinned flag if provided
+            if request.pinned is not None:
+                updates.append(f"pinned = ${param_idx}")
+                params.append(request.pinned)
                 param_idx += 1
 
             # Always update updated_at
