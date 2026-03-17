@@ -115,7 +115,7 @@ def get_db_pool_max_size() -> int:
 def is_auth_required() -> bool:
     """Whether API key authentication is required.
     When true, all requests (except /health) must include X-API-Key header."""
-    return os.getenv("AUTH_REQUIRED", "false").lower() in ("true", "1", "yes")
+    return os.getenv("AUTH_REQUIRED", "true").lower() in ("true", "1", "yes")
 
 def get_api_keys() -> List[str]:
     """Get valid API keys from environment (comma-separated).

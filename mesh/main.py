@@ -270,6 +270,9 @@ async def resolve_auth(request: Request) -> AuthContext:
 
     if db_key.get("is_admin"):
         ws = request.headers.get("X-Workspace", "default")
+        # DB keys cannot use wildcard workspace — only env-var admin keys can (#BLOCK-04)
+        if ws == "*":
+            raise HTTPException(status_code=403, detail="Wildcard workspace requires server admin key")
         all_ws = list(db_key.get("workspaces") or [])
         return AuthContext(workspace=ws, workspaces=all_ws or [ws], is_admin=True)
 
