@@ -177,6 +177,7 @@ async def mesh_focus(workspace: str, prefetch: bool = True, limit: int = 5) -> s
 
 @mcp.tool()
 async def mesh_search(query: str, limit: int = 10, tags: list[str] | None = None,
+                      workspaces: dict[str, float] | None = None,
                       workspace: str | None = None) -> str:
     """Semantic search across all documents in Mesh memory.
 
@@ -184,11 +185,14 @@ async def mesh_search(query: str, limit: int = 10, tags: list[str] | None = None
         query: What to search for (natural language)
         limit: Max results (default 10)
         tags: Optional tag filter (AND logic)
-        workspace: Target workspace (uses default if not set)
+        workspaces: Weighted multi-workspace search, e.g. {"sysadmin": 0.7, "security": 0.2}
+        workspace: Target workspace (uses default if not set). Ignored if workspaces is set.
     """
     body = {"query": query, "limit": limit}
     if tags:
         body["tags"] = tags
+    if workspaces:
+        body["workspaces"] = workspaces
     data = await _post("/search", body, workspace=workspace)
     results = data.get("results", [])
     if not results:

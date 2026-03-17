@@ -1304,6 +1304,90 @@ def _put_cached_embedding(text: str, embedding):
     _query_embedding_cache[text] = (embedding, time.time())
 
 
+
+async def _search_multi_workspace(
+    request: SearchRequest, auth: AuthContext, query_embedding: list
+) -> SearchResponse:
+    """Weighted multi-workspace search (#641).
+
+    1. Distribute limit proportionally by weight (min 1 per workspace)
+    2. Parallel search in each workspace via existing CRUD
+    3. Adjust scores: final_score = similarity * weight
+    4. Dedup by guid (max score wins), sort, return top N
+    """
+    workspaces = request.workspaces
+    total_limit = request.limit or 10
+
+    for ws, weight in workspaces.items():
+        if not (0.0 < weight <= 1.0):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Weight for '{ws}' must be between 0.0 and 1.0, got {weight}"
+            )
+
+    # Step 1: distribute limit
+    ws_limits = {ws: max(1, round(total_limit * w)) for ws, w in workspaces.items()}
+
+    # Step 2: parallel search per workspace
+    async def _search_ws(ws_name: str, ws_limit: int, weight: float):
+        ws_auth = AuthContext(workspace=ws_name, workspaces=[ws_name], is_admin=auth.is_admin)
+        scoped_emb = embedding_crud.with_auth(ws_auth)
+        _use_chunks = await scoped_emb.has_chunks()
+
+        if _use_chunks:
+            similar = await scoped_emb.search_similar_chunks(
+                query_embedding=query_embedding, limit=ws_limit,
+                similarity_threshold=get_similarity_threshold(),
+                tags=request.tags, date_from=request.date_from, date_to=request.date_to
+            )
+        else:
+            similar = await scoped_emb.search_similar_documents(
+                query_embedding=query_embedding, limit=ws_limit,
+                similarity_threshold=get_similarity_threshold(),
+                tags=request.tags, date_from=request.date_from, date_to=request.date_to
+            )
+
+        if not similar:
+            return []
+
+        score_map = {guid: score for guid, score in similar}
+        guids = list(score_map.keys())
+
+        async with rls_conn(ws_auth) as conn:
+            rows = await conn.fetch(
+                """SELECT guid, content, content_hash, filename, source,
+                          tags, created_at, updated_at, workspace_id
+                   FROM documents WHERE guid = ANY($1)""",
+                guids
+            )
+
+        return [
+            SearchResult(
+                guid=row['guid'], content=row['content'],
+                tags=list(row['tags']) if row['tags'] else [],
+                created_at=row['created_at'], updated_at=row.get('updated_at'),
+                similarity_score=round(score_map[row['guid']] * weight, 3),
+                directory="inbox",
+                workspace=row.get('workspace_id', ws_name)
+            )
+            for row in rows
+        ]
+
+    results_per_ws = await asyncio.gather(*[
+        _search_ws(ws, ws_limits[ws], workspaces[ws]) for ws in workspaces
+    ])
+
+    # Step 3: merge, dedup (max score per guid), sort
+    best = {}
+    for ws_results in results_per_ws:
+        for r in ws_results:
+            if r.guid not in best or r.similarity_score > best[r.guid].similarity_score:
+                best[r.guid] = r
+
+    merged = sorted(best.values(), key=lambda r: r.similarity_score, reverse=True)[:total_limit]
+
+    return SearchResponse(results=merged, total_count=len(merged), query=request.query)
+
 @app.post("/search", response_model=SearchResponse, dependencies=[Depends(check_search_rate_limit)])
 async def search_documents(request: SearchRequest, auth: AuthContext = Depends(resolve_auth)):
     """Hybrid search: semantic similarity + keyword fallback.
@@ -1332,6 +1416,10 @@ async def search_documents(request: SearchRequest, auth: AuthContext = Depends(r
                 None, embedding_service.generate_embedding, request.query
             )
             _put_cached_embedding(request.query, query_embedding)
+
+        # Weighted multi-workspace search
+        if request.workspaces:
+            return await _search_multi_workspace(request, auth, query_embedding)
 
         # Semantic search: prefer chunk-based search, fallback to doc_embeddings
         # Use auth-scoped CRUD so RLS filters by workspace

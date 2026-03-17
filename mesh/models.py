@@ -47,6 +47,7 @@ class SearchRequest(BaseModel):
     tags: Optional[List[str]] = Field(default=None, description="Filter results to documents containing ALL of these tags")
     date_from: Optional[datetime] = Field(default=None, description="Only return documents created on or after this date")
     date_to: Optional[datetime] = Field(default=None, description="Only return documents created on or before this date")
+    workspaces: Optional[dict] = Field(default=None, description="Weighted multi-workspace search: {workspace: weight 0.0-1.0}")
 
 class SearchResult(BaseModel):
     """Individual search result"""

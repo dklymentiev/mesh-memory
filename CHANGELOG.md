@@ -13,6 +13,18 @@ _(nothing yet)_
 
 ---
 
+## [1.4.0] - 2026-03-17
+
+### Added
+- **Weighted multi-workspace search** (#641)
+  - `POST /search` accepts `workspaces: {"sysadmin": 0.7, "security": 0.2}`
+  - Limit distributed proportionally (min 1 slot per workspace)
+  - Parallel search via asyncio.gather, scores adjusted by weight
+  - MCP: `mesh_search(workspaces={"ws": weight})` parameter
+  - Without `workspaces` param, behavior unchanged
+
+---
+
 ## [1.3.2] - 2026-03-17
 
 ### Fixed
