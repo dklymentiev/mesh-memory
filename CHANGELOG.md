@@ -13,6 +13,21 @@ _(nothing yet)_
 
 ---
 
+## [1.3.1] - 2026-03-17
+
+### Added
+- **Pinned documents**: pin documents to top of workspace listings (#611)
+  - `pinned` boolean column on documents table (default false)
+  - `PATCH /{guid}` accepts `{"pinned": true/false}` to pin/unpin
+  - `GET /` sorts pinned documents first (`ORDER BY pinned DESC, created_at DESC`)
+  - `mesh_update` MCP tool accepts `pinned` parameter
+  - Use case: role prompts for agent workspaces -- pinned doc always returned first
+
+### Fixed
+- Removed Cyrillic strings from `hooks/pre-search.sh` for i18n cleanliness
+
+---
+
 ## [1.3.0] - 2026-02-25
 
 ### Added

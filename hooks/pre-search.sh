@@ -23,7 +23,7 @@ if [ -z "$PROMPT" ] || [ ${#PROMPT} -lt 10 ]; then
 fi
 
 # Skip for simple greetings and commands
-if echo "$PROMPT" | grep -qiE '^(hi|hello|hey|ok|yes|no|да|нет|ок|ладно|привет|/|commit|push|pull)'; then
+if echo "$PROMPT" | grep -qiE '^(hi|hello|hey|ok|yes|no|sure|thanks|yep|nope|/|commit|push|pull)'; then
   exit 0
 fi
 
