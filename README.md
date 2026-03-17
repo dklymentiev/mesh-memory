@@ -182,6 +182,18 @@ Track how a document evolved over time. Mesh uses embedding similarity to find r
 curl "localhost:8000/versions/doc_4fa2cae8?threshold=0.85"
 ```
 
+### Pinned documents
+
+Pin important documents to always appear first in workspace listings. Perfect for role prompts, onboarding docs, or project briefs.
+
+```bash
+curl -X PATCH localhost:8000/doc_abc123 \
+  -H "Content-Type: application/json" \
+  -d '{"pinned": true}'
+```
+
+Pinned documents sort before all others in `GET /` listings.
+
 ### Built-in Web UI
 
 Served at `/ui/`:
@@ -197,12 +209,13 @@ For Claude Desktop, Claude Code, and Cursor:
 
 | Tool | What it does |
 |------|-------------|
-| `mesh_search` | Semantic search |
+| `mesh_search` | Semantic search (single or multi-workspace with weights) |
 | `mesh_add` | Save document (auto-tags applied) |
-| `mesh_update` | Update content or tags |
+| `mesh_update` | Update content, tags, or pinned status |
 | `mesh_delete` | Delete by GUID |
 | `mesh_get` | Get by GUID |
 | `mesh_bytag` | Filter by tags |
+| `mesh_focus` | Switch active workspace (with optional prefetch) |
 | `mesh_versions` | Document version chain |
 | `mesh_projects` | List projects with stats |
 | `mesh_stats` | Memory statistics |
@@ -244,6 +257,16 @@ curl -X POST localhost:8000/search \
 ```
 
 Without `X-Workspace`, everything goes to the `default` workspace. Fully backward-compatible.
+
+**Multi-workspace search** -- search across workspaces with weighted relevance:
+
+```bash
+curl -X POST localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "nginx config", "limit": 10, "workspaces": {"sysadmin": 0.7, "security": 0.2, "hq-architect": 0.1}}'
+```
+
+Each workspace gets proportional slots (min 1). Scores are adjusted by weight: a 0.85 match in a workspace with weight 0.3 becomes 0.255. Results are merged, deduped, and sorted by final score.
 
 **Scoped API keys** restrict access to specific workspaces:
 
