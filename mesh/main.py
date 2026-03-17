@@ -422,12 +422,13 @@ async def embedding_worker():
                     for idx, (chunk_text, emb) in enumerate(zip(chunks, embeddings)):
                         emb_str = '[' + ','.join(map(str, emb)) + ']'
                         await conn.execute(
-                            """INSERT INTO doc_chunks (guid, chunk_index, chunk_text, embedding)
-                               VALUES ($1, $2, $3, $4::vector)
+                            """INSERT INTO doc_chunks (guid, chunk_index, chunk_text, embedding, workspace_id)
+                               VALUES ($1, $2, $3, $4::vector, $5)
                                ON CONFLICT (guid, chunk_index) DO UPDATE SET
                                    chunk_text = EXCLUDED.chunk_text,
-                                   embedding = EXCLUDED.embedding""",
-                            guid, idx, chunk_text, emb_str
+                                   embedding = EXCLUDED.embedding,
+                                   workspace_id = EXCLUDED.workspace_id""",
+                            guid, idx, chunk_text, emb_str, workspace_id
                         )
 
                 # Backward compat: store first chunk embedding in doc_embeddings
@@ -1383,38 +1384,6 @@ async def search_documents(request: SearchRequest, auth: AuthContext = Depends(r
                 seen_guids.add(g)
             # Preserve similarity order
             results.sort(key=lambda r: r.similarity_score, reverse=True)
-
-        # Check if any semantic result contains the query literally
-        query_lower = request.query.lower()
-        has_exact_match = any(query_lower in r.content.lower() for r in results)
-
-        # If no exact match found, run keyword search and prepend hits
-        if not has_exact_match and len(query_lower) >= 3:
-            keyword_results = await document_crud.with_auth(auth).keyword_search(
-                query=request.query,
-                limit=limit,
-                tags=request.tags
-            )
-            keyword_hits = []
-            for doc in keyword_results:
-                if doc.guid not in seen_guids:
-                    # Apply date filters to keyword results too
-                    doc_dt = doc.created_at.replace(tzinfo=None) if doc.created_at else None
-                    if request.date_from and doc_dt and doc_dt < request.date_from.replace(tzinfo=None):
-                        continue
-                    if request.date_to and doc_dt and doc_dt > request.date_to.replace(tzinfo=None):
-                        continue
-                    keyword_hits.append(SearchResult(
-                        guid=doc.guid,
-                        content=doc.content,
-                        tags=doc.tags,
-                        created_at=doc.created_at,
-                        similarity_score=0.5,
-                        directory=doc.directory
-                    ))
-                    seen_guids.add(doc.guid)
-            # Put keyword matches first -- exact text hits are more relevant
-            results = keyword_hits + results
 
         return SearchResponse(
             results=results,

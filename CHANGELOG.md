@@ -13,6 +13,20 @@ _(nothing yet)_
 
 ---
 
+## [1.3.2] - 2026-03-17
+
+### Fixed
+- **Critical: chunk vector search broken with workspace RLS** (#655)
+  - HNSW index scanned all workspaces, RLS filtered post-scan → 0 results
+  - Added `workspace_id` column to `doc_chunks` table
+  - Chunk search now filters by workspace before HNSW scan
+  - Backfill migration for existing chunks
+
+### Removed
+- Keyword fallback in search endpoint — was masking the broken vector search
+
+---
+
 ## [1.3.1] - 2026-03-17
 
 ### Added

@@ -426,6 +426,12 @@ class EmbeddingCRUD:
                     params.append(limit)
                     inner_where = " AND ".join(inner_conditions)
 
+                    # Add workspace filter to avoid HNSW + RLS issue (#655)
+                    ws = self._auth.workspace if self._auth else "default"
+                    inner_where += f" AND c.workspace_id = ${idx}"
+                    params.append(ws)
+                    idx += 1
+
                     rows = await conn.fetch(
                         f"""
                         SELECT guid, MAX(sim) AS similarity_score
@@ -446,6 +452,8 @@ class EmbeddingCRUD:
                         *params
                     )
                 else:
+                    # Filter by workspace in inner query to avoid HNSW + RLS issue (#655)
+                    ws = self._auth.workspace if self._auth else "default"
                     rows = await conn.fetch(
                         """
                         SELECT guid, MAX(sim) AS similarity_score
@@ -453,6 +461,7 @@ class EmbeddingCRUD:
                             SELECT c.guid,
                                    1 - (c.embedding <=> $1::vector) AS sim
                             FROM doc_chunks c
+                            WHERE c.workspace_id = $5
                             ORDER BY c.embedding <=> $1::vector
                             LIMIT $3
                         ) sub
@@ -461,7 +470,7 @@ class EmbeddingCRUD:
                         ORDER BY similarity_score DESC
                         LIMIT $4
                         """,
-                        query_vector, similarity_threshold, chunk_limit, limit
+                        query_vector, similarity_threshold, chunk_limit, limit, ws
                     )
 
                 return [(row['guid'], float(row['similarity_score'])) for row in rows]

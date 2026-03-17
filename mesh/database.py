@@ -172,6 +172,15 @@ async def create_tables(pool: asyncpg.Pool) -> None:
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS doc_chunks_guid_idx ON doc_chunks(guid)
         """)
+
+        # Add workspace_id to doc_chunks for workspace-scoped vector search (#655)
+        await conn.execute("""
+            ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS workspace_id VARCHAR(64)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS doc_chunks_workspace_idx ON doc_chunks(workspace_id)
+        """)
+        # Backfill done via: UPDATE doc_chunks c SET workspace_id = d.workspace_id FROM documents d WHERE c.guid = d.guid AND c.workspace_id IS NULL
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS doc_chunks_hnsw_idx
             ON doc_chunks USING hnsw (embedding vector_cosine_ops)
