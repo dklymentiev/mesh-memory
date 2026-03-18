@@ -5,30 +5,51 @@
 
 ![Mesh Demo](app/demo.gif)
 
-**Save notes, decisions, worklogs. Find them by meaning, not keywords.**
+**A memory that understands what you mean, not just what you type.**
 
-You write a note "fixed the authentication bug in login flow". Two weeks later you search for "login problems" -- and regular search finds nothing because those words aren't in your note. Mesh finds it, because it understands that "authentication bug" and "login problems" mean the same thing.
+You save a note: *"changed the login page to fix the auth problem"*. A month later you search for *"security issues on the website"* -- and Mesh finds your note. Even though you never used the words "security", "issues", or "website". Because Mesh understands that these ideas are related.
 
-```bash
-# Save a note
-curl -X PUT localhost:8000/ \
-  -H "Content-Type: application/json" \
-  -d '{"content": "Fixed authentication bug in login flow", "tags": ["type:worklog"]}'
+### Why this matters
 
-# Search by meaning -- not exact words
-curl -X POST localhost:8000/search \
-  -H "Content-Type: application/json" \
-  -d '{"query": "login problems"}'
-# -> finds your note, even though "problems" isn't in the text
-```
+- You forget the exact words you used last time. Mesh doesn't care -- it searches by meaning.
+- Your notes, decisions, and research are scattered. Mesh keeps them in one place and finds connections.
+- AI agents need memory between sessions. Mesh gives them one -- searchable, organized, persistent.
 
-Self-hosted, single Docker container, no external APIs. Uses a local AI model for embeddings -- your data never leaves your server.
+### Who is Mesh for
+
+- **Solo developers** -- save decisions, worklogs, research. Find them months later with a vague question.
+- **Teams** -- each team gets its own workspace. Search across multiple workspaces with weighted priority.
+- **AI agents** -- Claude, GPT, or custom agents use Mesh as long-term memory via API or MCP tools.
+- **Anyone who takes notes** -- if you've ever lost a note because you couldn't remember the right keyword, Mesh solves that.
+
+### How it's different from regular search
 
 | Regular Search | Mesh Memory |
 |----------------|-------------|
-| "auth bug" finds "auth bug" | "auth bug" finds "login problem" |
-| Exact match only | Understands synonyms and context |
-| One language | Works across 100+ languages |
+| "auth bug" only finds "auth bug" | "auth bug" finds "login problem" |
+| Exact keyword match | Understands meaning and context |
+| One language at a time | Works across 100+ languages |
+| Forgets context | Remembers everything you saved |
+
+### Agent roles via workspaces
+
+Create a workspace for any role -- and your AI agent instantly becomes a specialist with full history. Workspaces are free-form, create as many as you need:
+
+- **sysadmin** -- server configs, incident fixes, monitoring notes
+- **marketer** -- campaigns, ad performance, content plans
+- **developer** -- architecture decisions, bug investigations, code reviews
+- **psychologist** -- session notes, client progress, therapy approaches
+- **support** -- customer issues, FAQ, product knowledge base
+- **researcher** -- papers, experiments, literature reviews
+- *...any role you can think of*
+
+Switch workspace -- and the agent sees only what's relevant to that role. No noise from other domains. Pin a role prompt to the top of each workspace, and the agent knows exactly who it is and what it should do.
+
+Need cross-domain context? Use weighted multi-workspace search: *"find nginx configs"* with 70% weight on sysadmin, 20% on security, 10% on developer -- and get results from all three, ranked by relevance and priority.
+
+### Privacy first
+
+Runs on your own server. Single Docker container. No cloud APIs, no subscriptions, no data leaving your machine. The AI model runs locally.
 
 ## Quick Start
 
@@ -617,3 +638,7 @@ For security issues, see [SECURITY.md](SECURITY.md).
 ## License
 
 MIT
+
+---
+
+Created by [Dmytro Klymentiev](https://klymentiev.com)
