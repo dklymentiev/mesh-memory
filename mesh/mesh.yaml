@@ -28,7 +28,7 @@ schema:
   source:
     prefix: "source:"
     description: "Origin of the document"
-    values: [api, cli, mcp, voice, chat, web, dacs, sync]
+    values: [api, cli, mcp, voice, chat, web, doci, sync]
 
   topic:
     prefix: "topic:"

@@ -42,21 +42,36 @@ from .taxonomy import TaxonomyStore
 
 logger = logging.getLogger(__name__)
 
-# Module-level store instance, initialized in init()
-_store: Optional[TaxonomyStore] = None
+# Per-workspace store instances, initialized lazily
+_stores: Dict[str, TaxonomyStore] = {}
+_pool: Optional[asyncpg.Pool] = None
 
 
-def get_store() -> Optional[TaxonomyStore]:
-    """Get the module-level TaxonomyStore (set by init()). Used by router."""
-    return _store
+async def _get_or_create_store(workspace_id: str = "default") -> TaxonomyStore:
+    """Lazy-load a TaxonomyStore for the given workspace."""
+    if workspace_id in _stores:
+        return _stores[workspace_id]
+    if _pool is None:
+        raise RuntimeError("Categorizer not initialized -- call init() first")
+    store = TaxonomyStore(_pool, workspace_id=workspace_id)
+    await store.load()
+    _stores[workspace_id] = store
+    logger.info(f"TaxonomyStore created for workspace '{workspace_id}' "
+                f"({len(store._centroids)} centroids)")
+    return store
 
 
-async def init(pool: asyncpg.Pool) -> None:
+def get_store(workspace_id: str = "default") -> Optional[TaxonomyStore]:
+    """Get an existing TaxonomyStore (set by init()). Used by router."""
+    return _stores.get(workspace_id)
+
+
+async def init(pool: asyncpg.Pool, workspace_id: str = "default") -> None:
     """Initialize the categorizer. Called from main.py lifespan."""
-    global _store
-    _store = TaxonomyStore(pool)
-    await _store.load()
-    if _store.taxonomy:
+    global _pool
+    _pool = pool
+    store = await _get_or_create_store(workspace_id)
+    if store.taxonomy:
         logger.info("Categorizer initialized with existing taxonomy")
     else:
         logger.info("Categorizer initialized (no taxonomy yet -- run bootstrap)")
@@ -67,24 +82,26 @@ async def classify(
     content: str,
     embedding: List[float],
     pool: asyncpg.Pool,
+    workspace_id: str = "default",
 ) -> Optional[ClassificationResult]:
     """Classify a single document and apply ai-category/ai-subcategory tags.
 
     Called from embedding_worker after embedding is stored.
     Returns None if categorizer is not ready (no taxonomy).
     """
-    if _store is None or not _store.centroids_loaded:
+    store = await _get_or_create_store(workspace_id)
+    if not store.centroids_loaded:
         return None
 
     # Embedding-based classification (~1ms)
-    result = classify_embedding(embedding, _store)
+    result = classify_embedding(embedding, store)
 
     # LLM refinement for ambiguous cases
-    if is_llm_available() and _store.taxonomy:
+    if is_llm_available() and store.taxonomy:
         ambiguous_low = 0.45
         ambiguous_high = 0.65
         if ambiguous_low <= result.category_score <= ambiguous_high:
-            llm_result = await classify_with_llm(content, _store.taxonomy, result)
+            llm_result = await classify_with_llm(content, store.taxonomy, result)
             if llm_result:
                 result = llm_result
 
@@ -105,6 +122,7 @@ async def bootstrap(
     sample_size: int = 1000,
     min_cluster_size: int = 5,
     mode: str = "cluster",
+    workspace_id: str = "default",
 ) -> Taxonomy:
     """Generate taxonomy.
 
@@ -113,13 +131,14 @@ async def bootstrap(
     - 'designed': LLM designs taxonomy from samples, embeddings build centroids
     """
     if mode == "designed":
-        return await _bootstrap_designed(pool, sample_size=sample_size)
-    return await _bootstrap_cluster(pool, use_llm, sample_size, min_cluster_size)
+        return await _bootstrap_designed(pool, sample_size=sample_size, workspace_id=workspace_id)
+    return await _bootstrap_cluster(pool, use_llm, sample_size, min_cluster_size, workspace_id=workspace_id)
 
 
 async def _bootstrap_designed(
     pool: asyncpg.Pool,
     sample_size: int = 500,
+    workspace_id: str = "default",
 ) -> Taxonomy:
     """LLM-designed taxonomy: LLM sees samples, proposes categories, then
     LLM classifies a batch of docs as seeds, centroids computed from those.
@@ -131,9 +150,7 @@ async def _bootstrap_designed(
              then recomputing centroids from the full classified set.
              (k-means with LLM-initialized centers)
     """
-    global _store
-    if _store is None:
-        _store = TaxonomyStore(pool)
+    store = await _get_or_create_store(workspace_id)
 
     logger.info("Bootstrap (designed mode) starting")
 
@@ -144,38 +161,45 @@ async def _bootstrap_designed(
             (SELECT guid, LEFT(content, 150) as preview,
                     array_to_string(tags, ', ') as tags_str
              FROM documents WHERE tags @> '{type:worklog}'::text[]
+               AND workspace_id = $1
              ORDER BY random() LIMIT 8)
             UNION ALL
             (SELECT guid, LEFT(content, 150),
                     array_to_string(tags, ', ')
              FROM documents WHERE tags @> '{type:note}'::text[]
+               AND workspace_id = $1
              ORDER BY random() LIMIT 7)
             UNION ALL
             (SELECT guid, LEFT(content, 150),
                     array_to_string(tags, ', ')
              FROM documents WHERE tags @> '{type:decision}'::text[]
+               AND workspace_id = $1
              ORDER BY random() LIMIT 5)
             UNION ALL
             (SELECT guid, LEFT(content, 150),
                     array_to_string(tags, ', ')
              FROM documents WHERE tags @> '{type:research}'::text[]
+               AND workspace_id = $1
              ORDER BY random() LIMIT 5)
             UNION ALL
             (SELECT guid, LEFT(content, 150),
                     array_to_string(tags, ', ')
              FROM documents WHERE tags @> '{type:artifact}'::text[]
+               AND workspace_id = $1
              ORDER BY random() LIMIT 5)
             UNION ALL
             (SELECT guid, LEFT(content, 150),
                     array_to_string(tags, ', ')
              FROM documents
              WHERE NOT EXISTS (SELECT 1 FROM unnest(tags) t WHERE t LIKE 'type:%')
+               AND workspace_id = $1
              ORDER BY random() LIMIT 10)
             UNION ALL
             (SELECT guid, LEFT(content, 150),
                     array_to_string(tags, ', ')
-             FROM documents ORDER BY random() LIMIT 10)
-        """)
+             FROM documents WHERE workspace_id = $1
+             ORDER BY random() LIMIT 10)
+        """, workspace_id)
 
     doc_samples = [
         {"preview": r["preview"].replace("\n", " "), "tags": r["tags_str"] or ""}
@@ -198,9 +222,10 @@ async def _bootstrap_designed(
             SELECT d.guid, LEFT(d.content, 150) as preview, e.embedding
             FROM documents d
             JOIN doc_embeddings e ON d.guid = e.guid
+            WHERE d.workspace_id = $2
             ORDER BY random()
             LIMIT $1
-        """, min(sample_size, 500))
+        """, min(sample_size, 500), workspace_id)
 
     seed_docs = [
         {"guid": r["guid"], "preview": r["preview"].replace("\n", " ")}
@@ -263,7 +288,9 @@ async def _bootstrap_designed(
         all_rows = await conn.fetch("""
             SELECT e.guid, e.embedding
             FROM doc_embeddings e
-        """)
+            JOIN documents d ON d.guid = e.guid
+            WHERE d.workspace_id = $1
+        """, workspace_id)
 
     logger.info(f"Phase 4: Refining centroids using {len(all_rows)} document embeddings")
 
@@ -325,7 +352,9 @@ async def _bootstrap_designed(
     # Fetch content previews for LLM naming
     async with pool.acquire() as conn:
         content_rows = await conn.fetch(
-            "SELECT guid, LEFT(content, 300) as preview FROM documents"
+            "SELECT guid, LEFT(content, 300) as preview FROM documents "
+            "WHERE workspace_id = $1",
+            workspace_id,
         )
     guid_to_content: Dict[str, str] = {r["guid"]: r["preview"] for r in content_rows}
 
@@ -420,9 +449,9 @@ async def _bootstrap_designed(
 
     # Save
     taxonomy = Taxonomy(version=1, categories=categories)
-    await _store.save(taxonomy)
+    await store.save(taxonomy)
     if centroid_rows:
-        await _store.save_centroids(centroid_rows)
+        await store.save_centroids(centroid_rows)
 
     total_subs = sum(len(c.subcategories) for c in categories)
     logger.info(f"Bootstrap (designed) complete: {len(categories)} categories, "
@@ -436,6 +465,7 @@ async def _bootstrap_cluster(
     use_llm: bool = False,
     sample_size: int = 1000,
     min_cluster_size: int = 5,
+    workspace_id: str = "default",
 ) -> Taxonomy:
     """Generate taxonomy via two-phase clustering.
 
@@ -443,11 +473,10 @@ async def _bootstrap_cluster(
     Phase 2: Meta-cluster centroids -> 10-15 macro-categories (high-level)
     Phase 3: LLM names macro-categories from micro-cluster summaries
     """
-    global _store
-    if _store is None:
-        _store = TaxonomyStore(pool)
+    store = await _get_or_create_store(workspace_id)
 
-    logger.info(f"Bootstrap starting (use_llm={use_llm}, sample_size={sample_size})")
+    logger.info(f"Bootstrap starting (use_llm={use_llm}, sample_size={sample_size}, "
+                f"workspace={workspace_id})")
 
     # -- Fetch embeddings --
     async with pool.acquire() as conn:
@@ -456,16 +485,18 @@ async def _bootstrap_cluster(
             SELECT e.guid, e.embedding, d.content, d.tags
             FROM doc_embeddings e
             JOIN documents d ON d.guid = e.guid
+            WHERE d.workspace_id = $2
             ORDER BY d.updated_at DESC
             LIMIT $1
             """,
             sample_size,
+            workspace_id,
         )
 
     if len(rows) < min_cluster_size * 2:
         logger.warning(f"Not enough documents for clustering ({len(rows)})")
         taxonomy = Taxonomy(version=1, categories=[])
-        await _store.save(taxonomy)
+        await store.save(taxonomy)
         return taxonomy
 
     guids, embeddings, contents, all_tags = [], [], [], []
@@ -591,8 +622,8 @@ async def _bootstrap_cluster(
 
     # Save
     taxonomy = Taxonomy(version=1, categories=categories)
-    await _store.save(taxonomy)
-    await _store.save_centroids(centroid_rows)
+    await store.save(taxonomy)
+    await store.save_centroids(centroid_rows)
 
     logger.info(f"Bootstrap complete: {len(categories)} categories, {len(centroid_rows)} centroids")
     return taxonomy
@@ -602,13 +633,15 @@ async def batch_scan(
     pool: asyncpg.Pool,
     limit: int = 500,
     force: bool = False,
+    workspace_id: str = "default",
 ) -> Dict[str, int]:
     """Batch classify documents that don't have ai-category tags.
 
     Uses vectorized cosine similarity for speed, then batched DB updates.
     Returns stats: {"classified": N, "uncategorized": M, "skipped": K, "errors": E}
     """
-    if _store is None or not _store.centroids_loaded:
+    store = await _get_or_create_store(workspace_id)
+    if not store.centroids_loaded:
         return {"error": "No taxonomy loaded. Run bootstrap first."}
 
     stats = {"classified": 0, "uncategorized": 0, "skipped": 0, "errors": 0}
@@ -620,10 +653,12 @@ async def batch_scan(
                 SELECT e.guid, e.embedding
                 FROM doc_embeddings e
                 JOIN documents d ON d.guid = e.guid
+                WHERE d.workspace_id = $2
                 ORDER BY d.updated_at DESC
                 LIMIT $1
                 """,
                 limit,
+                workspace_id,
             )
         else:
             rows = await conn.fetch(
@@ -631,7 +666,8 @@ async def batch_scan(
                 SELECT e.guid, e.embedding
                 FROM doc_embeddings e
                 JOIN documents d ON d.guid = e.guid
-                WHERE NOT EXISTS (
+                WHERE d.workspace_id = $2
+                  AND NOT EXISTS (
                     SELECT 1 FROM unnest(d.tags) AS t
                     WHERE t LIKE 'ai-category:%'
                 )
@@ -639,13 +675,14 @@ async def batch_scan(
                 LIMIT $1
                 """,
                 limit,
+                workspace_id,
             )
 
     if not rows:
         return stats
 
     # Build centroid matrix for vectorized classification
-    cat_centroids = _store.get_category_centroids()
+    cat_centroids = store.get_category_centroids()
     cat_ids = list(cat_centroids.keys())
     cat_names = [cat_centroids[cid][1] for cid in cat_ids]
     centroid_matrix = np.vstack([cat_centroids[cid][0] for cid in cat_ids])
@@ -658,7 +695,7 @@ async def batch_scan(
     # Precompute subcategory centroid matrices per category
     sub_matrices: Dict[str, tuple] = {}  # cat_id -> (sub_ids, normed_matrix)
     for cat_id in cat_ids:
-        sub_centroids = _store.get_subcategory_centroids(cat_id)
+        sub_centroids = store.get_subcategory_centroids(cat_id)
         if sub_centroids:
             sub_ids_list = list(sub_centroids.keys())
             sub_matrix = np.vstack([sub_centroids[sid][0] for sid in sub_ids_list])

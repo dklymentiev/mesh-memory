@@ -73,3 +73,4 @@ ui/demo*
 
 # Recording artifacts
 scripts/record-demo.mjs
+.github/workflows/

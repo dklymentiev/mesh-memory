@@ -47,6 +47,18 @@ class BatchRequest(BaseModel):
     force: bool = Field(default=False, description="Re-classify already tagged docs")
 
 
+class CategoryCreateRequest(BaseModel):
+    id: str = Field(..., max_length=64, description="Slug identifier for the category")
+    name: str = Field(..., max_length=200, description="Display name")
+    description: str = Field(default="", description="What this category covers")
+    parent_id: Optional[str] = Field(default=None, description="Parent category ID for subcategories")
+
+
+class CategoryUpdateRequest(BaseModel):
+    name: str = Field(..., max_length=200, description="New display name")
+    description: Optional[str] = Field(default=None, description="New description")
+
+
 class TaxonomyResponse(BaseModel):
     taxonomy: Taxonomy
     stats: dict = Field(default_factory=dict)

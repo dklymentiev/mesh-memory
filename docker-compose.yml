@@ -16,6 +16,7 @@ services:
       - "127.0.0.1:5433:5432"
     volumes:
       - mesh_postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/10-mesh-app-role.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-meshdb}"]
       interval: 10s
@@ -37,7 +38,7 @@ services:
       - default
       - traefik-net
     labels:
-      - "traefik.enable=true"
+      - "traefik.enable=false"
       - "traefik.docker.network=traefik-net"
       - "traefik.http.routers.mesh.rule=Host(`${TRAEFIK_HOST:-mesh.example.com}`)"
       - "traefik.http.routers.mesh.entrypoints=https"
@@ -46,7 +47,11 @@ services:
       - "traefik.http.routers.mesh.middlewares=mesh-vpn@file"
       - "traefik.http.services.mesh.loadbalancer.server.port=8000"
     environment:
+      # Superuser connection (for migrations)
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-meshdb}
+      # App role connection (RLS enforced) -- falls back to DATABASE_URL if not set
+      DATABASE_URL_APP: ${DATABASE_URL_APP:-}
+      MESH_APP_PASSWORD: ${MESH_APP_PASSWORD:-}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-intfloat/multilingual-e5-base}
       AUTH_REQUIRED: ${AUTH_REQUIRED:-false}
       API_KEYS: ${API_KEYS:-}
@@ -55,6 +60,7 @@ services:
       TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
       RATE_LIMIT_SEARCH: ${RATE_LIMIT_SEARCH:-60}
       RATE_LIMIT_EMBED: ${RATE_LIMIT_EMBED:-30}
+      RATE_LIMIT_HEAVY: ${RATE_LIMIT_HEAVY:-60}
       DB_POOL_MIN_SIZE: ${DB_POOL_MIN_SIZE:-1}
       DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-10}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -90,7 +96,7 @@ services:
       - default
       - traefik-net
     labels:
-      - "traefik.enable=true"
+      - "traefik.enable=false"
       - "traefik.docker.network=traefik-net"
       - "traefik.http.routers.mesh-demo.rule=Host(`${TRAEFIK_DEMO_HOST:-mesh-demo.example.com}`)"
       - "traefik.http.routers.mesh-demo.entrypoints=https"

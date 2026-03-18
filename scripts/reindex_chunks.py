@@ -80,8 +80,11 @@ async def main():
             logger.warning(f"  {guid}: empty content, skipping")
             continue
 
-        # Batch-embed all chunks
-        embeddings = embedding_service.generate_embeddings_batch(chunks)
+        # Batch-embed all chunks (run in executor to avoid blocking event loop)
+        loop = asyncio.get_running_loop()
+        embeddings = await loop.run_in_executor(
+            None, embedding_service.generate_embeddings_batch, chunks
+        )
 
         # Store chunks
         async with pool.acquire() as conn:

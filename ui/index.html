@@ -181,6 +181,7 @@ html, body {
   <nav>
     <a href="/ui/" class="active">Search</a>
     <a href="/ui/map.html">Map</a>
+    <a href="/ui/settings.html">Settings</a>
   </nav>
   <div class="stats">
     <span>docs: <b id="st-docs">--</b></span>
@@ -191,6 +192,9 @@ html, body {
 
 <!-- Search -->
 <div class="search-bar">
+  <select id="ctl-workspace" style="padding:10px 8px;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-family:inherit;font-size:13px;outline:none;min-width:120px;">
+    <option value="">default</option>
+  </select>
   <input id="q" type="text" placeholder="Semantic search..." autofocus>
 </div>
 
@@ -223,8 +227,46 @@ let activeChip = null;
 let searchGen = 0;
 let debounceTimer = null;
 
+function getWorkspace() {
+  const el = document.getElementById('ctl-workspace');
+  return el ? el.value : '';
+}
+
+function wsHeaders(extra) {
+  const h = extra ? { ...extra } : {};
+  const ws = getWorkspace();
+  if (ws) h['X-Workspace'] = ws;
+  return h;
+}
+
+async function loadWorkspaces() {
+  try {
+    const r = await fetch(API + '/admin/workspaces');
+    const data = await r.json();
+    const sel = document.getElementById('ctl-workspace');
+    if (!sel || !Array.isArray(data)) return;
+    sel.innerHTML = '';
+    data.forEach(ws => {
+      const opt = document.createElement('option');
+      opt.value = ws.workspace === 'default' ? '' : ws.workspace;
+      opt.textContent = ws.workspace + ' (' + ws.documents + ')';
+      sel.appendChild(opt);
+    });
+    // Restore from URL if present
+    const params = new URLSearchParams(location.search);
+    if (params.get('ws')) sel.value = params.get('ws');
+    // Reload on workspace change
+    sel.addEventListener('change', () => {
+      loadStats();
+      const q = document.getElementById('q').value.trim();
+      if (q) doSearch();
+    });
+  } catch(e) { console.warn('Failed to load workspaces:', e); }
+}
+
 // ---- Init ----
 document.addEventListener('DOMContentLoaded', () => {
+  loadWorkspaces();
   loadStats();
   buildChips();
   const params = new URLSearchParams(location.search);
@@ -238,7 +280,7 @@ document.addEventListener('DOMContentLoaded', () => {
 // ---- Stats ----
 async function loadStats() {
   try {
-    const r = await fetch(API + '/stats');
+    const r = await fetch(API + '/stats', { headers: wsHeaders() });
     const d = await r.json();
     document.getElementById('st-docs').textContent = d.documents;
     document.getElementById('st-idx').textContent = d.indexed;
@@ -315,7 +357,7 @@ async function doSearch() {
     if (activeChip) body.tags = ['type:' + activeChip];
     const r = await fetch(API + '/search', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: wsHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(body)
     });
     const data = await r.json();
@@ -391,7 +433,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closePanel()
 
 async function openDocByGuid(guid) {
   try {
-    const r = await fetch(API + '/' + guid);
+    const r = await fetch(API + '/' + guid, { headers: wsHeaders() });
     if (!r.ok) return;
     const doc = await r.json();
     document.getElementById('p-date').textContent = doc.created_at ? new Date(doc.created_at).toLocaleString() : '';

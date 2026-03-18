@@ -21,6 +21,9 @@ import asyncio
 from contextlib import asynccontextmanager
 import logging
 
+import hashlib
+import secrets
+
 from .models import (
     DocumentCreateRequest,
     DocumentResponse,
@@ -28,17 +31,19 @@ from .models import (
     SearchResponse,
     SearchResult,
     MetadataRequest,
-    MetadataResponse
+    MetadataResponse,
+    AuthContext,
 )
 from .categorizer.config import is_categorizer_enabled
 from .config import (
-    get_database_url, get_similarity_threshold, get_ip_whitelist,
+    get_database_url, get_app_database_url, get_app_role_password,
+    get_similarity_threshold, get_ip_whitelist,
     get_cors_origins, is_debug_enabled, get_rate_limit_search,
-    get_rate_limit_embed, is_auth_required, get_api_keys,
+    get_rate_limit_embed, get_rate_limit_heavy, is_auth_required, get_api_keys,
     get_db_pool_min_size, get_db_pool_max_size, get_log_level,
-    get_max_content_length, verify_baked_model
+    get_max_content_length, get_embedding_model_name, verify_baked_model
 )
-from .database import create_tables
+from .database import create_tables, create_app_role
 from .embeddings import get_embedding_service
 from .crud import DocumentCRUD, EmbeddingCRUD, MetadataCRUD
 from .utils import generate_document_guid, validate_document_guid, normalize_tags
@@ -106,7 +111,7 @@ class RateLimiter:
 
 _search_limiter = RateLimiter(get_rate_limit_search())
 _embed_limiter = RateLimiter(get_rate_limit_embed())
-_heavy_limiter = RateLimiter(10)  # 10 req/min for CPU-intensive endpoints
+_heavy_limiter = RateLimiter(get_rate_limit_heavy())
 
 
 def _get_client_ip(request: Request) -> str:
@@ -176,7 +181,7 @@ class IPWhitelistMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-# API Key authentication
+# API Key authentication (env-var admin keys)
 _AUTH_REQUIRED = is_auth_required()
 _API_KEYS = set(get_api_keys())
 
@@ -189,9 +194,142 @@ if _AUTH_REQUIRED and not _API_KEYS:
 # Paths exempt from authentication (health probes, public help)
 _AUTH_EXEMPT_PATHS = {"/health", "/help"}
 
+# In-memory cache for DB API key lookups: sha256(key) -> (row_dict, timestamp)
+_db_key_cache: dict[str, tuple] = {}
+_DB_KEY_CACHE_TTL = 60  # seconds
+
+
+def _hash_api_key(raw_key: str) -> str:
+    """SHA-256 hash of an API key (used as DB primary key)."""
+    return hashlib.sha256(raw_key.encode()).hexdigest()
+
+
+async def _lookup_db_key(key_hash: str) -> dict | None:
+    """Look up a scoped API key in the database, with caching."""
+    now = time.monotonic()
+    cached = _db_key_cache.get(key_hash)
+    if cached and (now - cached[1]) < _DB_KEY_CACHE_TTL:
+        return cached[0]
+
+    if not db_pool:
+        return None
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT key_hash, label, workspaces, is_admin FROM api_keys WHERE key_hash = $1",
+            key_hash
+        )
+
+    if row:
+        result = dict(row)
+        _db_key_cache[key_hash] = (result, now)
+        # Touch last_used (fire and forget)
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE api_keys SET last_used = NOW() WHERE key_hash = $1", key_hash
+                )
+        except Exception:
+            pass
+        return result
+
+    _db_key_cache[key_hash] = (None, now)
+    return None
+
+
+async def resolve_auth(request: Request) -> AuthContext:
+    """FastAPI dependency: resolve API key into AuthContext.
+
+    Auth flow:
+      1. Key in env API_KEYS? -> admin, workspace from X-Workspace header
+      2. SHA-256(key) in api_keys table? -> scoped, workspace validated
+      3. Not found? -> 401
+      4. Auth disabled? -> admin with default workspace
+    """
+    if not _AUTH_REQUIRED:
+        ws = request.headers.get("X-Workspace", "default")
+        return AuthContext(workspace=ws, workspaces=[ws], is_admin=True)
+
+    api_key = request.headers.get("X-API-Key")
+    if not api_key:
+        raise HTTPException(status_code=401, detail="Missing X-API-Key header")
+
+    # Check env-var admin keys
+    if api_key in _API_KEYS:
+        ws = request.headers.get("X-Workspace", "default")
+        if ws == "*":
+            return AuthContext(workspace="*", workspaces=["*"], is_admin=True)
+        return AuthContext(workspace=ws, workspaces=[ws], is_admin=True)
+
+    # Check DB scoped keys
+    key_hash = _hash_api_key(api_key)
+    db_key = await _lookup_db_key(key_hash)
+    if not db_key:
+        logger.warning(f"Invalid API key attempt from {_get_client_ip(request)}")
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+    if db_key.get("is_admin"):
+        ws = request.headers.get("X-Workspace", "default")
+        # DB keys cannot use wildcard workspace — only env-var admin keys can (#BLOCK-04)
+        if ws == "*":
+            raise HTTPException(status_code=403, detail="Wildcard workspace requires server admin key")
+        all_ws = list(db_key.get("workspaces") or [])
+        return AuthContext(workspace=ws, workspaces=all_ws or [ws], is_admin=True)
+
+    # Scoped key: validate requested workspace
+    allowed = list(db_key.get("workspaces") or [])
+    if not allowed:
+        raise HTTPException(status_code=403, detail="Key has no workspace access")
+
+    ws = request.headers.get("X-Workspace")
+    if not ws:
+        # Default to the first allowed workspace
+        ws = allowed[0]
+
+    if ws not in allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Key does not have access to workspace '{ws}'. Allowed: {allowed}"
+        )
+
+    return AuthContext(workspace=ws, workspaces=allowed, is_admin=False)
+
+
+async def _set_rls_context(conn, auth: AuthContext):
+    """Set RLS session variables on a connection.
+
+    Uses SET (session-level) so it persists across statements on this connection.
+    Admin override only when workspace is '*' (all workspaces).
+    """
+    workspaces_csv = ",".join(auth.workspaces) if auth.workspaces else auth.workspace
+    rls_admin = auth.is_admin and workspaces_csv == "*"
+    await conn.execute(
+        "SELECT set_config('app.workspaces', $1, false)", workspaces_csv
+    )
+    await conn.execute(
+        "SELECT set_config('app.is_admin', $1, false)", str(rls_admin).lower()
+    )
+
+
+@asynccontextmanager
+async def rls_conn(auth: AuthContext):
+    """Acquire a connection from db_pool with RLS context set.
+
+    Usage:
+        async with rls_conn(auth) as conn:
+            rows = await conn.fetch("SELECT ...")
+    """
+    async with db_pool.acquire() as conn:
+        await _set_rls_context(conn, auth)
+        yield conn
+
 
 class APIKeyAuthMiddleware(BaseHTTPMiddleware):
-    """Require X-API-Key header when AUTH_REQUIRED=true"""
+    """Legacy middleware: reject unauthenticated requests early.
+
+    The real auth logic is in resolve_auth() dependency.
+    This middleware only handles the quick reject for exempt paths.
+    """
 
     async def dispatch(self, request: Request, call_next):
         if not _AUTH_REQUIRED:
@@ -207,18 +345,23 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
                 content={"detail": "Missing X-API-Key header"}
             )
 
+        # Quick check env keys; DB keys verified in resolve_auth()
         if api_key not in _API_KEYS:
-            logger.warning(f"Invalid API key attempt from {_get_client_ip(request)}")
-            return JSONResponse(
-                status_code=403,
-                content={"detail": "Invalid API key"}
-            )
+            key_hash = _hash_api_key(api_key)
+            db_key = await _lookup_db_key(key_hash)
+            if not db_key:
+                logger.warning(f"Invalid API key attempt from {_get_client_ip(request)}")
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Invalid API key"}
+                )
 
         return await call_next(request)
 
 
-# Global database pool and services
-db_pool = None
+# Global database pools and services
+migration_pool = None  # superuser pool for schema migrations (bypasses RLS)
+db_pool = None          # app pool (mesh_app role, RLS enforced)
 document_crud = None
 embedding_crud = None
 metadata_crud = None
@@ -235,6 +378,8 @@ async def embedding_worker():
     them in ``doc_chunks``.  The first chunk embedding is also written to
     ``doc_embeddings`` for backward compatibility (visualize, tag inference,
     categorizer all read from ``doc_embeddings``).
+
+    Queue items are (guid, content, workspace_id) tuples.
     """
     global embedding_queue
     logger.info("Embedding worker started")
@@ -245,7 +390,13 @@ async def embedding_worker():
     while True:
         try:
             # Wait for document guid from queue
-            guid, content = await embedding_queue.get()
+            item = await embedding_queue.get()
+            # Support both old (guid, content) and new (guid, content, workspace) tuples
+            if len(item) == 3:
+                guid, content, workspace_id = item
+            else:
+                guid, content = item
+                workspace_id = "default"
 
             try:
                 embedding_service = await get_embedding_service()
@@ -262,29 +413,50 @@ async def embedding_worker():
                 )
 
                 # Store chunks in doc_chunks (delete old first for re-index)
+                # Set RLS context so the worker can access the document's workspace
                 async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "SELECT set_config('app.workspaces', $1, false)", workspace_id
+                    )
+                    await conn.execute(
+                        "SELECT set_config('app.is_admin', 'false', false)"
+                    )
                     await conn.execute("DELETE FROM doc_chunks WHERE guid = $1", guid)
                     for idx, (chunk_text, emb) in enumerate(zip(chunks, embeddings)):
                         emb_str = '[' + ','.join(map(str, emb)) + ']'
                         await conn.execute(
-                            """INSERT INTO doc_chunks (guid, chunk_index, chunk_text, embedding)
-                               VALUES ($1, $2, $3, $4::vector)
+                            """INSERT INTO doc_chunks (guid, chunk_index, chunk_text, embedding, workspace_id)
+                               VALUES ($1, $2, $3, $4::vector, $5)
                                ON CONFLICT (guid, chunk_index) DO UPDATE SET
                                    chunk_text = EXCLUDED.chunk_text,
-                                   embedding = EXCLUDED.embedding""",
-                            guid, idx, chunk_text, emb_str
+                                   embedding = EXCLUDED.embedding,
+                                   workspace_id = EXCLUDED.workspace_id""",
+                            guid, idx, chunk_text, emb_str, workspace_id
                         )
 
                 # Backward compat: store first chunk embedding in doc_embeddings
                 first_embedding = embeddings[0]
-                await embedding_crud.store_embedding(guid, first_embedding)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "SELECT set_config('app.workspaces', $1, false)", workspace_id
+                    )
+                    await conn.execute(
+                        "SELECT set_config('app.is_admin', 'false', false)"
+                    )
+                    emb_str = '[' + ','.join(map(str, first_embedding)) + ']'
+                    await conn.execute(
+                        """INSERT INTO doc_embeddings (guid, embedding)
+                           VALUES ($1, $2::vector)
+                           ON CONFLICT (guid) DO UPDATE SET embedding = EXCLUDED.embedding""",
+                        guid, emb_str
+                    )
                 _visualize_cache.clear()
                 logger.info(f"Indexed {guid}: {len(chunks)} chunks (queue: {embedding_queue.qsize()})")
 
                 # Auto-infer tags from nearest neighbors (uses doc_embeddings)
                 if tag_schema.infer_enabled:
                     try:
-                        await _infer_tags_from_neighbors(guid)
+                        await _infer_tags_from_neighbors(guid, workspace_id)
                     except Exception as infer_err:
                         logger.warning(f"Tag inference failed for {guid}: {infer_err}")
 
@@ -292,7 +464,10 @@ async def embedding_worker():
                 if is_categorizer_enabled():
                     try:
                         from .categorizer import classify as categorizer_classify
-                        await categorizer_classify(guid, chunks[0], first_embedding, db_pool)
+                        await categorizer_classify(
+                            guid, chunks[0], first_embedding, db_pool,
+                            workspace_id=workspace_id,
+                        )
                     except Exception as cat_err:
                         logger.warning(f"Categorizer failed for {guid}: {cat_err}")
             except Exception as e:
@@ -310,7 +485,8 @@ async def embedding_worker():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
-    global db_pool, document_crud, embedding_crud, metadata_crud, embedding_queue, embedding_worker_tasks
+    global migration_pool, db_pool, document_crud, embedding_crud, metadata_crud
+    global embedding_queue, embedding_worker_tasks
 
     try:
         # Startup
@@ -319,13 +495,26 @@ async def lifespan(app: FastAPI):
         # Verify baked model matches runtime config
         verify_baked_model()
 
-        # Initialize database
-        db_pool = await asyncpg.create_pool(
+        # 1. Superuser pool for migrations
+        migration_pool = await asyncpg.create_pool(
             get_database_url(),
+            min_size=1,
+            max_size=3
+        )
+        await create_tables(migration_pool)
+
+        # Create mesh_app role if password provided
+        app_password = get_app_role_password()
+        if app_password:
+            await create_app_role(migration_pool, app_password)
+
+        # 2. App pool (mesh_app role with RLS) -- or superuser if not configured
+        app_db_url = get_app_database_url()
+        db_pool = await asyncpg.create_pool(
+            app_db_url,
             min_size=get_db_pool_min_size(),
             max_size=get_db_pool_max_size()
         )
-        await create_tables(db_pool)
 
         # Auto-seed demo data if ENVIRONMENT=demo and DB is empty
         if os.getenv("ENVIRONMENT") == "demo":
@@ -379,14 +568,17 @@ async def lifespan(app: FastAPI):
         logger.info(f"Started {NUM_WORKERS} embedding workers")
 
         # Requeue pending documents (no embeddings yet)
-        async with db_pool.acquire() as conn:
+        # Use migration pool (superuser) to see all workspaces
+        async with migration_pool.acquire() as conn:
             pending = await conn.fetch("""
-                SELECT d.guid, d.content FROM documents d
+                SELECT d.guid, d.content, d.workspace_id FROM documents d
                 LEFT JOIN doc_embeddings e ON d.guid = e.guid
                 WHERE e.guid IS NULL
             """)
             for row in pending:
-                await embedding_queue.put((row['guid'], row['content']))
+                await embedding_queue.put((
+                    row['guid'], row['content'], row.get('workspace_id', 'default')
+                ))
             if pending:
                 logger.info(f"Requeued {len(pending)} pending documents for indexing")
 
@@ -476,10 +668,12 @@ async def lifespan(app: FastAPI):
                 pass
         if db_pool:
             await db_pool.close()
+        if migration_pool:
+            await migration_pool.close()
         logger.info("Mesh API shutdown complete")
 
 
-async def _infer_tags_from_neighbors(guid: str):
+async def _infer_tags_from_neighbors(guid: str, workspace_id: str = "default"):
     """Infer tags from nearest neighbors after embedding is stored."""
     n = tag_schema.infer_neighbors
     threshold = tag_schema.infer_threshold
@@ -491,6 +685,9 @@ async def _infer_tags_from_neighbors(guid: str):
         return
 
     async with db_pool.acquire() as conn:
+        # Set RLS context for neighbor lookup within same workspace
+        await conn.execute("SELECT set_config('app.workspaces', $1, false)", workspace_id)
+        await conn.execute("SELECT set_config('app.is_admin', 'false', false)")
         row = await conn.fetchrow("SELECT tags FROM documents WHERE guid = $1", guid)
         if not row:
             return
@@ -571,6 +768,7 @@ app.add_middleware(
 
 # Starlette executes middleware in LIFO order of add_middleware calls.
 # Register auth FIRST, then IP whitelist LAST so IP check runs first at request time.
+# APIKeyAuthMiddleware does early reject; real auth is via resolve_auth() dependency.
 app.add_middleware(APIKeyAuthMiddleware)
 app.add_middleware(IPWhitelistMiddleware)
 
@@ -581,7 +779,7 @@ if is_categorizer_enabled():
 
 # ---- On-demand document summarization ----
 @app.post("/summarize/{guid}", dependencies=[Depends(check_heavy_rate_limit)])
-async def summarize_document(guid: str):
+async def summarize_document(guid: str, auth: AuthContext = Depends(resolve_auth)):
     """Generate a 2-3 sentence summary for a document using LLM. Cached in DB."""
     from .categorizer.config import get_llm_api_url, get_llm_api_key, get_llm_model, get_llm_timeout, is_llm_available
     import httpx
@@ -589,7 +787,7 @@ async def summarize_document(guid: str):
     if not is_llm_available():
         raise HTTPException(status_code=503, detail="LLM not configured")
 
-    async with db_pool.acquire() as conn:
+    async with rls_conn(auth) as conn:
         row = await conn.fetchrow(
             "SELECT content, summary FROM documents WHERE guid = $1", guid
         )
@@ -630,9 +828,10 @@ async def summarize_document(guid: str):
             raise HTTPException(status_code=502, detail="LLM call failed")
 
         # Store in DB
-        await conn.execute(
-            "UPDATE documents SET summary = $1 WHERE guid = $2", summary, guid
-        )
+        async with rls_conn(auth) as conn2:
+            await conn2.execute(
+                "UPDATE documents SET summary = $1 WHERE guid = $2", summary, guid
+            )
 
         return {"guid": guid, "summary": summary, "cached": False}
 
@@ -663,7 +862,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.put("/", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED,
          dependencies=[Depends(check_heavy_rate_limit)])
-async def create_document(request: DocumentCreateRequest):
+async def create_document(request: DocumentCreateRequest, auth: AuthContext = Depends(resolve_auth)):
     """Create a new document with automatic GUID generation and async embedding"""
     try:
         # Validate input length
@@ -695,13 +894,15 @@ async def create_document(request: DocumentCreateRequest):
         # Generate GUID
         guid = generate_document_guid()
 
-        # Create document in database
-        document = await document_crud.create_document(guid, request)
+        # Create document (CRUD sets RLS context via with_auth)
+        document = await document_crud.with_auth(auth).create_document(
+            guid, request, workspace_id=auth.workspace
+        )
 
         # Queue embedding generation (async, non-blocking)
-        await embedding_queue.put((guid, request.content))
+        await embedding_queue.put((guid, request.content, auth.workspace))
 
-        logger.info(f"Created document {guid}, queued for embedding")
+        logger.info(f"Created document {guid} in workspace '{auth.workspace}', queued for embedding")
         return document
 
     except HTTPException:
@@ -721,7 +922,8 @@ async def create_document(request: DocumentCreateRequest):
 
 @app.put("/doc/{guid}", response_model=DocumentResponse,
          dependencies=[Depends(check_heavy_rate_limit)])
-async def upsert_document(guid: str, request: DocumentCreateRequest):
+async def upsert_document(guid: str, request: DocumentCreateRequest,
+                          auth: AuthContext = Depends(resolve_auth)):
     """Create or update a document with a specific GUID (upsert)"""
     try:
         # Validate input length
@@ -746,12 +948,14 @@ async def upsert_document(guid: str, request: DocumentCreateRequest):
         request.tags = normalized_tags
 
         # Upsert document in database
-        document = await document_crud.upsert_document(guid, request)
+        document = await document_crud.with_auth(auth).upsert_document(
+            guid, request, workspace_id=auth.workspace
+        )
 
         # Queue embedding generation (async, non-blocking)
-        await embedding_queue.put((guid, request.content))
+        await embedding_queue.put((guid, request.content, auth.workspace))
 
-        logger.info(f"Upserted document {guid}, queued for embedding")
+        logger.info(f"Upserted document {guid} in workspace '{auth.workspace}', queued for embedding")
         return document
 
     except HTTPException:
@@ -772,7 +976,8 @@ async def root_endpoint(
     type: Optional[str] = Query(default=None, description="Filter by document type (worklog, note, etc)"),
     source: Optional[str] = Query(default=None, description="Filter by source (api, cli, voice, chat)"),
     tag: Optional[List[str]] = Query(default=None, description="Filter by tag(s). Multiple tags use AND logic."),
-    list_all: bool = Query(default=False, alias="all", description="List all documents (no filter, sorted by date desc)")
+    list_all: bool = Query(default=False, alias="all", description="List all documents (no filter, sorted by date desc)"),
+    auth: AuthContext = Depends(resolve_auth),
 ):
     """Root endpoint: returns README from memory if available, otherwise help. With params, returns documents."""
     # If no parameters provided (just browsing), return README from memory or fallback help
@@ -781,7 +986,7 @@ async def root_endpoint(
         # Try to fetch the latest README from memory
         if db_pool:
             try:
-                async with db_pool.acquire() as conn:
+                async with rls_conn(auth) as conn:
                     readme_doc = await conn.fetchrow("""
                         SELECT guid, content, created_at
                         FROM documents
@@ -871,6 +1076,21 @@ async def root_endpoint(
                     "description": "Full API documentation (this help)"
                 }
             },
+            "workspaces": {
+                "description": "Workspaces provide isolated document spaces. Each workspace has its own documents, tags, and search index. Documents in one workspace are invisible to others.",
+                "header": "X-Workspace: workspace-name",
+                "default": "If no header is sent, documents go to the 'default' workspace.",
+                "auto_created": "Workspaces are created automatically on first document save -- no setup needed.",
+                "examples": {
+                    "create_in_workspace": "curl -X PUT $API_URL/ -H 'Content-Type: application/json' -H 'X-Workspace: my-agent' -d '{\"content\":\"text\",\"tags\":[\"type:note\"]}'",
+                    "search_in_workspace": "curl -X POST $API_URL/search -H 'Content-Type: application/json' -H 'X-Workspace: my-agent' -d '{\"query\":\"find this\",\"limit\":5}'",
+                    "list_in_workspace": "curl '$API_URL/?limit=10' -H 'X-Workspace: my-agent'"
+                },
+                "admin": {
+                    "list_workspaces": "GET /admin/workspaces - list all workspaces with document counts",
+                    "delete_workspace": "DELETE /admin/workspaces/{name} - delete workspace and all its documents"
+                }
+            },
             "curl_examples": {
                 "create": "curl -X PUT $API_URL/ -H 'Content-Type: application/json' -d '{\"content\":\"My note\",\"tags\":[\"type:note\",\"date:2025-12-30\"]}'",
                 "search": "curl -X POST $API_URL/search -H 'Content-Type: application/json' -d '{\"query\":\"PostgreSQL optimization\",\"limit\":3}'",
@@ -926,13 +1146,13 @@ async def root_endpoint(
             for t in tag:
                 filter_tags.append(t)
 
-        # Fetch documents
-        async with db_pool.acquire() as conn:
+        # Fetch documents (RLS filters by workspace automatically)
+        async with rls_conn(auth) as conn:
             if filter_tags:
                 # Filter by ALL tags (AND logic)
                 query = """
                     SELECT guid, content, content_hash, filename, source,
-                           tags, created_at, updated_at
+                           tags, created_at, updated_at, pinned
                     FROM documents
                     WHERE """
 
@@ -943,7 +1163,7 @@ async def root_endpoint(
                     query += f"${ i + 1 }::text = ANY(tags)"
 
                 query += f"""
-                    ORDER BY created_at DESC
+                    ORDER BY pinned DESC, created_at DESC
                     LIMIT ${len(filter_tags) + 1} OFFSET ${len(filter_tags) + 2}
                 """
 
@@ -952,9 +1172,9 @@ async def root_endpoint(
                 # No filters - return recent documents
                 rows = await conn.fetch("""
                     SELECT guid, content, content_hash, filename, source,
-                           tags, created_at, updated_at
+                           tags, created_at, updated_at, pinned
                     FROM documents
-                    ORDER BY created_at DESC
+                    ORDER BY pinned DESC, created_at DESC
                     LIMIT $1 OFFSET $2
                 """, limit, offset)
 
@@ -968,7 +1188,9 @@ async def root_endpoint(
                     tags=list(row['tags']) if row['tags'] else [],
                     created_at=row['created_at'],
                     updated_at=row['updated_at'],
-                    directory="inbox"
+                    directory="inbox",
+                    workspace=row.get('workspace_id', 'default') if 'workspace_id' in row.keys() else auth.workspace,
+                    pinned=row.get('pinned', False) if 'pinned' in row.keys() else False
                 )
                 for row in rows
             ]
@@ -1085,8 +1307,92 @@ def _put_cached_embedding(text: str, embedding):
     _query_embedding_cache[text] = (embedding, time.time())
 
 
+
+async def _search_multi_workspace(
+    request: SearchRequest, auth: AuthContext, query_embedding: list
+) -> SearchResponse:
+    """Weighted multi-workspace search (#641).
+
+    1. Distribute limit proportionally by weight (min 1 per workspace)
+    2. Parallel search in each workspace via existing CRUD
+    3. Adjust scores: final_score = similarity * weight
+    4. Dedup by guid (max score wins), sort, return top N
+    """
+    workspaces = request.workspaces
+    total_limit = request.limit or 10
+
+    for ws, weight in workspaces.items():
+        if not (0.0 < weight <= 1.0):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Weight for '{ws}' must be between 0.0 and 1.0, got {weight}"
+            )
+
+    # Step 1: distribute limit
+    ws_limits = {ws: max(1, round(total_limit * w)) for ws, w in workspaces.items()}
+
+    # Step 2: parallel search per workspace
+    async def _search_ws(ws_name: str, ws_limit: int, weight: float):
+        ws_auth = AuthContext(workspace=ws_name, workspaces=[ws_name], is_admin=auth.is_admin)
+        scoped_emb = embedding_crud.with_auth(ws_auth)
+        _use_chunks = await scoped_emb.has_chunks()
+
+        if _use_chunks:
+            similar = await scoped_emb.search_similar_chunks(
+                query_embedding=query_embedding, limit=ws_limit,
+                similarity_threshold=get_similarity_threshold(),
+                tags=request.tags, date_from=request.date_from, date_to=request.date_to
+            )
+        else:
+            similar = await scoped_emb.search_similar_documents(
+                query_embedding=query_embedding, limit=ws_limit,
+                similarity_threshold=get_similarity_threshold(),
+                tags=request.tags, date_from=request.date_from, date_to=request.date_to
+            )
+
+        if not similar:
+            return []
+
+        score_map = {guid: score for guid, score in similar}
+        guids = list(score_map.keys())
+
+        async with rls_conn(ws_auth) as conn:
+            rows = await conn.fetch(
+                """SELECT guid, content, content_hash, filename, source,
+                          tags, created_at, updated_at, workspace_id
+                   FROM documents WHERE guid = ANY($1)""",
+                guids
+            )
+
+        return [
+            SearchResult(
+                guid=row['guid'], content=row['content'],
+                tags=list(row['tags']) if row['tags'] else [],
+                created_at=row['created_at'], updated_at=row.get('updated_at'),
+                similarity_score=round(score_map[row['guid']] * weight, 3),
+                directory="inbox",
+                workspace=row.get('workspace_id', ws_name)
+            )
+            for row in rows
+        ]
+
+    results_per_ws = await asyncio.gather(*[
+        _search_ws(ws, ws_limits[ws], workspaces[ws]) for ws in workspaces
+    ])
+
+    # Step 3: merge, dedup (max score per guid), sort
+    best = {}
+    for ws_results in results_per_ws:
+        for r in ws_results:
+            if r.guid not in best or r.similarity_score > best[r.guid].similarity_score:
+                best[r.guid] = r
+
+    merged = sorted(best.values(), key=lambda r: r.similarity_score, reverse=True)[:total_limit]
+
+    return SearchResponse(results=merged, total_count=len(merged), query=request.query)
+
 @app.post("/search", response_model=SearchResponse, dependencies=[Depends(check_search_rate_limit)])
-async def search_documents(request: SearchRequest):
+async def search_documents(request: SearchRequest, auth: AuthContext = Depends(resolve_auth)):
     """Hybrid search: semantic similarity + keyword fallback.
 
     Runs semantic search first, then checks if the query text appears
@@ -1114,21 +1420,31 @@ async def search_documents(request: SearchRequest):
             )
             _put_cached_embedding(request.query, query_embedding)
 
+        # Weighted multi-workspace search
+        if request.workspaces:
+            return await _search_multi_workspace(request, auth, query_embedding)
+
         # Semantic search: prefer chunk-based search, fallback to doc_embeddings
-        _use_chunks = await embedding_crud.has_chunks()
+        # Use auth-scoped CRUD so RLS filters by workspace
+        scoped_emb = embedding_crud.with_auth(auth)
+        _use_chunks = await scoped_emb.has_chunks()
         if _use_chunks:
-            similar_docs = await embedding_crud.search_similar_chunks(
+            similar_docs = await scoped_emb.search_similar_chunks(
                 query_embedding=query_embedding,
                 limit=limit,
                 similarity_threshold=get_similarity_threshold(),
-                tags=request.tags
+                tags=request.tags,
+                date_from=request.date_from,
+                date_to=request.date_to
             )
         else:
-            similar_docs = await embedding_crud.search_similar_documents(
+            similar_docs = await scoped_emb.search_similar_documents(
                 query_embedding=query_embedding,
                 limit=limit,
                 similarity_threshold=get_similarity_threshold(),
-                tags=request.tags
+                tags=request.tags,
+                date_from=request.date_from,
+                date_to=request.date_to
             )
 
         # Build results from semantic search (batch fetch to avoid N+1)
@@ -1137,10 +1453,10 @@ async def search_documents(request: SearchRequest):
         if similar_docs:
             score_map = {guid: score for guid, score in similar_docs}
             guids = list(score_map.keys())
-            async with db_pool.acquire() as conn:
+            async with rls_conn(auth) as conn:
                 rows = await conn.fetch(
                     """SELECT guid, content, content_hash, filename, source,
-                              tags, created_at, updated_at
+                              tags, created_at, updated_at, workspace_id
                        FROM documents WHERE guid = ANY($1)""",
                     guids
                 )
@@ -1151,38 +1467,14 @@ async def search_documents(request: SearchRequest):
                     content=row['content'],
                     tags=list(row['tags']) if row['tags'] else [],
                     created_at=row['created_at'],
+                    updated_at=row.get('updated_at'),
                     similarity_score=round(score_map[g], 3),
-                    directory="inbox"
+                    directory="inbox",
+                    workspace=row.get('workspace_id', 'default')
                 ))
                 seen_guids.add(g)
             # Preserve similarity order
             results.sort(key=lambda r: r.similarity_score, reverse=True)
-
-        # Check if any semantic result contains the query literally
-        query_lower = request.query.lower()
-        has_exact_match = any(query_lower in r.content.lower() for r in results)
-
-        # If no exact match found, run keyword search and prepend hits
-        if not has_exact_match and len(query_lower) >= 3:
-            keyword_results = await document_crud.keyword_search(
-                query=request.query,
-                limit=limit,
-                tags=request.tags
-            )
-            keyword_hits = []
-            for doc in keyword_results:
-                if doc.guid not in seen_guids:
-                    keyword_hits.append(SearchResult(
-                        guid=doc.guid,
-                        content=doc.content,
-                        tags=doc.tags,
-                        created_at=doc.created_at,
-                        similarity_score=0.5,
-                        directory=doc.directory
-                    ))
-                    seen_guids.add(doc.guid)
-            # Put keyword matches first -- exact text hits are more relevant
-            results = keyword_hits + results
 
         return SearchResponse(
             results=results,
@@ -1202,10 +1494,11 @@ async def search_documents(request: SearchRequest):
 @app.get("/browse")
 async def browse_all_documents(
     preview: int = Query(default=300, ge=50, le=1000, description="Preview length"),
+    auth: AuthContext = Depends(resolve_auth),
 ):
     """Return all documents with short previews for client-side search."""
     try:
-        async with db_pool.acquire() as conn:
+        async with rls_conn(auth) as conn:
             rows = await conn.fetch("""
                 SELECT guid,
                        LEFT(content, $1) AS preview,
@@ -1240,12 +1533,13 @@ async def browse_all_documents(
 async def keyword_search(
     q: str = Query(..., min_length=1, description="Keyword to search for"),
     limit: int = Query(default=20, ge=1, le=100),
-    tag: Optional[str] = Query(default=None, description="Filter by tag")
+    tag: Optional[str] = Query(default=None, description="Filter by tag"),
+    auth: AuthContext = Depends(resolve_auth),
 ):
     """Fast keyword search (ILIKE) -- no embedding, instant results."""
     try:
         tags = [tag] if tag else None
-        docs = await document_crud.keyword_search(query=q, limit=limit, tags=tags)
+        docs = await document_crud.with_auth(auth).keyword_search(query=q, limit=limit, tags=tags)
         return {
             "results": [
                 {
@@ -1268,7 +1562,7 @@ async def keyword_search(
 
 
 @app.post("/embed", dependencies=[Depends(check_embed_rate_limit)])
-async def generate_embedding(request: dict):
+async def generate_embedding(request: dict, auth: AuthContext = Depends(resolve_auth)):
     """Generate embedding vector for given text. Returns 768-dim vector."""
     text = request.get("text", "")
     if not text.strip():
@@ -1290,7 +1584,7 @@ async def generate_embedding(request: dict):
 
 
 @app.post("/embed/batch", dependencies=[Depends(check_embed_rate_limit)])
-async def generate_embeddings_batch(request: dict):
+async def generate_embeddings_batch(request: dict, auth: AuthContext = Depends(resolve_auth)):
     """Generate embeddings for multiple texts. Max 100 texts per request."""
     texts = request.get("texts", [])
     if not texts:
@@ -1318,10 +1612,10 @@ async def generate_embeddings_batch(request: dict):
 
 
 @app.get("/stats")
-async def get_stats():
+async def get_stats(auth: AuthContext = Depends(resolve_auth)):
     """Get API statistics including queue status"""
     try:
-        async with db_pool.acquire() as conn:
+        async with rls_conn(auth) as conn:
             doc_count = await conn.fetchval("SELECT COUNT(*) FROM documents")
             emb_count = await conn.fetchval("SELECT COUNT(*) FROM doc_embeddings")
 
@@ -1344,6 +1638,17 @@ async def get_stats():
                 "SELECT MAX(created_at) FROM documents"
             )
 
+        # Workspace summary (counts only, no content exposed)
+        async with migration_pool.acquire() as pool_conn:
+            workspace_rows = await pool_conn.fetch("""
+                SELECT workspace_id,
+                       COUNT(*) as doc_count,
+                       MAX(updated_at) as last_activity
+                FROM documents
+                GROUP BY workspace_id
+                ORDER BY doc_count DESC
+            """)
+
         return {
             "documents": doc_count,
             "indexed": emb_count,
@@ -1351,7 +1656,16 @@ async def get_stats():
             "projects": project_count or 0,
             "tags": tag_count or 0,
             "queue_size": embedding_queue.qsize() if embedding_queue else 0,
-            "last_update": last_update.isoformat() if last_update else None
+            "last_update": last_update.isoformat() if last_update else None,
+            "workspaces": [
+                {
+                    "workspace": row["workspace_id"],
+                    "documents": row["doc_count"],
+                    "last_activity": row["last_activity"].isoformat()
+                    if row["last_activity"] else None,
+                }
+                for row in workspace_rows
+            ],
         }
     except Exception as e:
         logger.error(f"Stats failed: {e}")
@@ -1363,14 +1677,15 @@ async def get_stats():
 @app.get("/short")
 async def get_short_documents(
     max_length: int = Query(default=10, ge=1, le=100, description="Maximum content length"),
-    limit: int = Query(default=50, ge=1, le=200, description="Maximum documents to return")
+    limit: int = Query(default=50, ge=1, le=200, description="Maximum documents to return"),
+    auth: AuthContext = Depends(resolve_auth),
 ):
     """Find documents with short content (for cleanup)"""
     try:
         if not db_pool:
             return {"error": "Database not available"}
 
-        async with db_pool.acquire() as conn:
+        async with rls_conn(auth) as conn:
             rows = await conn.fetch("""
                 SELECT guid, content, tags, created_at, LENGTH(TRIM(content)) as content_length
                 FROM documents
@@ -1399,11 +1714,12 @@ async def get_short_documents(
 @app.get("/tags")
 async def get_tags(
     prefix: Optional[str] = Query(default=None, description="Filter tags by prefix (e.g. 'guid:', 'type:', 'source:')"),
-    limit: int = Query(default=100, ge=1, le=1000, description="Maximum tags to return")
+    limit: int = Query(default=100, ge=1, le=1000, description="Maximum tags to return"),
+    auth: AuthContext = Depends(resolve_auth),
 ):
     """Get list of all unique tags with document counts"""
     try:
-        async with db_pool.acquire() as conn:
+        async with rls_conn(auth) as conn:
             if prefix:
                 # Filter by prefix
                 rows = await conn.fetch("""
@@ -1463,11 +1779,12 @@ async def get_tags(
 @app.get("/activity")
 async def get_activity(
     prefix: Optional[str] = Query(default=None, description="Tag prefix filter (e.g., 'guid:', 'type:', 'project:')"),
-    limit: int = Query(default=20, ge=1, le=100, description="Maximum tags to return")
+    limit: int = Query(default=20, ge=1, le=100, description="Maximum tags to return"),
+    auth: AuthContext = Depends(resolve_auth),
 ):
     """Get activity by tags - shows last update date for each tag"""
     try:
-        async with db_pool.acquire() as conn:
+        async with rls_conn(auth) as conn:
             if prefix:
                 # Filter by tag prefix
                 rows = await conn.fetch("""
@@ -1519,13 +1836,15 @@ async def get_activity(
 MAX_BULK_DOCUMENTS = 100
 
 @app.put("/bulk", dependencies=[Depends(check_heavy_rate_limit)])
-async def bulk_create_documents(documents: List[DocumentCreateRequest]):
+async def bulk_create_documents(documents: List[DocumentCreateRequest],
+                                auth: AuthContext = Depends(resolve_auth)):
     """Bulk create documents - saves immediately, embeddings queued. Max 100 per request."""
     if len(documents) > MAX_BULK_DOCUMENTS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Too many documents ({len(documents)}). Maximum {MAX_BULK_DOCUMENTS} per request."
         )
+    scoped_crud = document_crud.with_auth(auth)
     created = 0
     skipped = 0
     for doc in documents:
@@ -1539,8 +1858,8 @@ async def bulk_create_documents(documents: List[DocumentCreateRequest]):
             doc.tags = normalized_tags
             guid = generate_document_guid()
 
-            await document_crud.create_document(guid, doc)
-            await embedding_queue.put((guid, doc.content))
+            await scoped_crud.create_document(guid, doc, workspace_id=auth.workspace)
+            await embedding_queue.put((guid, doc.content, auth.workspace))
             created += 1
         except Exception as e:
             logger.error(f"Bulk create error: {e}")
@@ -1549,10 +1868,10 @@ async def bulk_create_documents(documents: List[DocumentCreateRequest]):
     return {"created": created, "skipped": skipped, "queue_size": embedding_queue.qsize()}
 
 @app.get("/by-hash/{content_hash}", dependencies=[Depends(check_heavy_rate_limit)])
-async def get_document_by_hash(content_hash: str):
+async def get_document_by_hash(content_hash: str, auth: AuthContext = Depends(resolve_auth)):
     """Find document by content MD5 hash"""
     try:
-        async with db_pool.acquire() as conn:
+        async with rls_conn(auth) as conn:
             row = await conn.fetchrow(
                 "SELECT guid, content_hash, created_at, updated_at FROM documents WHERE content_hash = $1",
                 content_hash
@@ -1586,12 +1905,13 @@ class DocumentUpdateRequest(BaseModel):
     tags: Optional[List[str]] = None
     add_tags: Optional[List[str]] = None  # Add to existing tags
     remove_tags: Optional[List[str]] = None  # Remove from existing tags
+    pinned: Optional[bool] = None  # Pin document to top of workspace
 
 @app.patch("/by-hash", dependencies=[Depends(check_heavy_rate_limit)])
-async def update_document_by_hash(request: HashUpdateRequest):
+async def update_document_by_hash(request: HashUpdateRequest, auth: AuthContext = Depends(resolve_auth)):
     """Update document dates or content by MD5 hash"""
     try:
-        async with db_pool.acquire() as conn:
+        async with rls_conn(auth) as conn:
             # Find document
             row = await conn.fetchrow(
                 "SELECT guid FROM documents WHERE content_hash = $1",
@@ -1641,7 +1961,7 @@ async def update_document_by_hash(request: HashUpdateRequest):
         )
 
 @app.delete("/{guid}", dependencies=[Depends(check_heavy_rate_limit)])
-async def delete_document(guid: str):
+async def delete_document(guid: str, auth: AuthContext = Depends(resolve_auth)):
     """Delete a document by its GUID"""
     try:
         if not validate_document_guid(guid):
@@ -1653,7 +1973,7 @@ async def delete_document(guid: str):
         if not db_pool:
             raise HTTPException(status_code=503, detail="Database not available")
 
-        async with db_pool.acquire() as conn:
+        async with rls_conn(auth) as conn:
             result = await conn.execute("DELETE FROM documents WHERE guid = $1", guid)
             # result format: "DELETE N" where N is number of rows deleted
             deleted_count = int(result.split()[-1])
@@ -1677,7 +1997,8 @@ async def delete_document(guid: str):
         )
 
 @app.patch("/{guid}", dependencies=[Depends(check_heavy_rate_limit)])
-async def update_document(guid: str, request: DocumentUpdateRequest):
+async def update_document(guid: str, request: DocumentUpdateRequest,
+                          auth: AuthContext = Depends(resolve_auth)):
     """Update a document by GUID - supports content and tag modifications"""
     try:
         if not validate_document_guid(guid):
@@ -1689,7 +2010,7 @@ async def update_document(guid: str, request: DocumentUpdateRequest):
         if not db_pool:
             raise HTTPException(status_code=503, detail="Database not available")
 
-        async with db_pool.acquire() as conn:
+        async with rls_conn(auth) as conn:
             # Get current document
             row = await conn.fetchrow(
                 "SELECT content, tags FROM documents WHERE guid = $1", guid
@@ -1735,6 +2056,12 @@ async def update_document(guid: str, request: DocumentUpdateRequest):
                 params.append(current_tags)
                 param_idx += 1
 
+            # Update pinned flag if provided
+            if request.pinned is not None:
+                updates.append(f"pinned = ${param_idx}")
+                params.append(request.pinned)
+                param_idx += 1
+
             # Always update updated_at
             updates.append(f"updated_at = ${param_idx}")
             params.append(datetime.now(timezone.utc))
@@ -1763,7 +2090,7 @@ async def update_document(guid: str, request: DocumentUpdateRequest):
 # ============== METADATA ENDPOINTS ==============
 
 @app.get("/meta/{guid}", response_model=MetadataResponse, dependencies=[Depends(check_search_rate_limit)])
-async def get_metadata(guid: str):
+async def get_metadata(guid: str, auth: AuthContext = Depends(resolve_auth)):
     """Get metadata for a document"""
     try:
         if not validate_document_guid(guid):
@@ -1772,7 +2099,7 @@ async def get_metadata(guid: str):
                 detail=f"Invalid GUID format: {guid}"
             )
 
-        metadata = await metadata_crud.get_metadata(guid)
+        metadata = await metadata_crud.with_auth(auth).get_metadata(guid)
         if not metadata:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1792,7 +2119,7 @@ async def get_metadata(guid: str):
 
 
 @app.put("/meta/{guid}", response_model=MetadataResponse, dependencies=[Depends(check_search_rate_limit)])
-async def upsert_metadata(guid: str, request: MetadataRequest):
+async def upsert_metadata(guid: str, request: MetadataRequest, auth: AuthContext = Depends(resolve_auth)):
     """Create or update metadata for a document"""
     try:
         if not validate_document_guid(guid):
@@ -1801,7 +2128,7 @@ async def upsert_metadata(guid: str, request: MetadataRequest):
                 detail=f"Invalid GUID format: {guid}"
             )
 
-        metadata = await metadata_crud.upsert_metadata(guid, request)
+        metadata = await metadata_crud.with_auth(auth).upsert_metadata(guid, request)
         logger.info(f"Upserted metadata for {guid}: type={request.doc_type}")
         return metadata
 
@@ -1821,7 +2148,7 @@ async def upsert_metadata(guid: str, request: MetadataRequest):
 
 
 @app.delete("/meta/{guid}", dependencies=[Depends(check_search_rate_limit)])
-async def delete_metadata(guid: str):
+async def delete_metadata(guid: str, auth: AuthContext = Depends(resolve_auth)):
     """Delete metadata for a document"""
     try:
         if not validate_document_guid(guid):
@@ -1830,7 +2157,7 @@ async def delete_metadata(guid: str):
                 detail=f"Invalid GUID format: {guid}"
             )
 
-        deleted = await metadata_crud.delete_metadata(guid)
+        deleted = await metadata_crud.with_auth(auth).delete_metadata(guid)
         if not deleted:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1852,16 +2179,18 @@ async def delete_metadata(guid: str):
 @app.get("/meta", response_model=list, dependencies=[Depends(check_search_rate_limit)])
 async def list_metadata(
     type: Optional[str] = Query(default=None, description="Filter by doc_type"),
-    limit: int = Query(default=100, ge=1, le=1000)
+    limit: int = Query(default=100, ge=1, le=1000),
+    auth: AuthContext = Depends(resolve_auth),
 ):
     """List metadata records, optionally filtered by type"""
     try:
+        scoped_meta = metadata_crud.with_auth(auth)
         if type:
-            results = await metadata_crud.list_by_type(type, limit)
+            results = await scoped_meta.list_by_type(type, limit)
         else:
             # List all - get from database directly
             import json
-            async with db_pool.acquire() as conn:
+            async with rls_conn(auth) as conn:
                 rows = await conn.fetch(
                     """
                     SELECT guid, doc_type, metadata, extracted_at, extractor_version
@@ -1905,7 +2234,8 @@ async def visualize_documents(
     limit: int = Query(default=2000, ge=10, le=10000, description="Max documents to visualize"),
     tag: Optional[str] = Query(default=None, description="Filter by tag"),
     sample: Optional[str] = Query(default=None, description="Sampling: 'uniform' for even time distribution"),
-    nocache: bool = Query(default=False, description="Skip cache")
+    nocache: bool = Query(default=False, description="Skip cache"),
+    auth: AuthContext = Depends(resolve_auth),
 ):
     """
     Get 2D coordinates for document visualization using PCA dimensionality reduction.
@@ -1913,8 +2243,8 @@ async def visualize_documents(
     Results cached for 5 minutes.
     """
     try:
-        # Check cache
-        cache_key = f"{limit}:{tag}:{sample}"
+        # Check cache (workspace-scoped)
+        cache_key = f"{auth.workspace}:{limit}:{tag}:{sample}"
         if not nocache and cache_key in _visualize_cache:
             cached = _visualize_cache[cache_key]
             if time.time() - cached["ts"] < _VISUALIZE_CACHE_TTL:
@@ -1922,7 +2252,7 @@ async def visualize_documents(
                 return cached["data"]
 
         # Build query based on filters
-        async with db_pool.acquire() as conn:
+        async with rls_conn(auth) as conn:
             if sample == "uniform":
                 # Uniform sampling across time: use ntile to get evenly spaced docs
                 if tag:
@@ -2073,7 +2403,8 @@ async def get_version_chain(
     guid: str,
     threshold: float = Query(default=0.85, ge=0.5, le=0.99, description="Similarity threshold"),
     limit: int = Query(default=20, ge=1, le=100, description="Max versions to return"),
-    same_project: bool = Query(default=True, description="Only docs from same project (guid: tag)")
+    same_project: bool = Query(default=True, description="Only docs from same project (guid: tag)"),
+    auth: AuthContext = Depends(resolve_auth),
 ):
     """Find chronological version chain of a document via embedding similarity.
 
@@ -2091,7 +2422,7 @@ async def get_version_chain(
         if not db_pool:
             raise HTTPException(status_code=503, detail="Database not available")
 
-        async with db_pool.acquire() as conn:
+        async with rls_conn(auth) as conn:
             # Get target document info (use subquery for embedding comparison)
             target = await conn.fetchrow("""
                 SELECT d.guid, d.tags, d.created_at, LENGTH(d.content) as content_length
@@ -2204,10 +2535,155 @@ async def get_schema():
     """
     return tag_schema.to_dict()
 
+# ============== ADMIN ENDPOINTS ==============
+
+async def _require_admin(auth: AuthContext = Depends(resolve_auth)) -> AuthContext:
+    """Dependency: require admin access."""
+    if not auth.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return auth
+
+
+@app.post("/admin/keys")
+async def create_api_key(
+    request: dict,
+    auth: AuthContext = Depends(_require_admin),
+):
+    """Create a scoped API key. Returns the raw key ONCE -- store it securely."""
+    label = request.get("label", "")
+    workspaces = request.get("workspaces", [])
+    is_admin = request.get("is_admin", False)
+
+    if not workspaces and not is_admin:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide at least one workspace or set is_admin=true"
+        )
+
+    # Generate a random API key
+    raw_key = f"msh_{secrets.token_hex(24)}"
+    key_hash = _hash_api_key(raw_key)
+
+    async with migration_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO api_keys (key_hash, label, workspaces, is_admin)
+               VALUES ($1, $2, $3, $4)""",
+            key_hash, label, workspaces, is_admin
+        )
+
+    logger.info(f"Created API key '{label}' hash={key_hash[:12]}... workspaces={workspaces}")
+    return {
+        "key": raw_key,
+        "key_hash": key_hash,
+        "label": label,
+        "workspaces": workspaces,
+        "is_admin": is_admin,
+        "note": "Store the key securely. It cannot be retrieved again."
+    }
+
+
+@app.get("/admin/keys")
+async def list_api_keys(auth: AuthContext = Depends(_require_admin)):
+    """List all API keys (hashes only, not raw keys)."""
+    async with migration_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT key_hash, label, workspaces, is_admin, created_at, last_used
+               FROM api_keys ORDER BY created_at DESC"""
+        )
+    return [
+        {
+            "key_hash": row["key_hash"],
+            "label": row["label"],
+            "workspaces": list(row["workspaces"]) if row["workspaces"] else [],
+            "is_admin": row["is_admin"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            "last_used": row["last_used"].isoformat() if row["last_used"] else None,
+        }
+        for row in rows
+    ]
+
+
+@app.delete("/admin/keys/{key_hash}")
+async def revoke_api_key(key_hash: str, auth: AuthContext = Depends(_require_admin)):
+    """Revoke an API key by its hash."""
+    async with migration_pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM api_keys WHERE key_hash = $1", key_hash
+        )
+    deleted = int(result.split()[-1])
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Key not found")
+    # Invalidate cache
+    _db_key_cache.pop(key_hash, None)
+    logger.info(f"Revoked API key hash={key_hash[:12]}...")
+    return {"deleted": True, "key_hash": key_hash}
+
+
+@app.get("/admin/workspaces")
+async def list_workspaces(auth: AuthContext = Depends(_require_admin)):
+    """List all workspaces with document counts."""
+    async with migration_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT workspace_id,
+                   COUNT(*) as doc_count,
+                   MAX(updated_at) as last_activity
+            FROM documents
+            GROUP BY workspace_id
+            ORDER BY doc_count DESC
+        """)
+    return [
+        {
+            "workspace": row["workspace_id"],
+            "documents": row["doc_count"],
+            "last_activity": row["last_activity"].isoformat() if row["last_activity"] else None,
+        }
+        for row in rows
+    ]
+
+
+@app.delete("/admin/workspaces/{workspace_id}")
+async def delete_workspace(
+    workspace_id: str,
+    confirm: bool = Query(False),
+    auth: AuthContext = Depends(_require_admin),
+):
+    """Delete a workspace and all its documents."""
+    if workspace_id == "default":
+        raise HTTPException(status_code=400, detail="Cannot delete the default workspace")
+    if not confirm:
+        raise HTTPException(status_code=400, detail="Pass ?confirm=true to confirm deletion")
+    async with migration_pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM documents WHERE workspace_id = $1", workspace_id
+        )
+    deleted = int(result.split()[-1])
+    logger.info(f"Deleted workspace '{workspace_id}': {deleted} documents removed")
+    return {"deleted": True, "workspace_id": workspace_id, "documents_removed": deleted}
+
+
+@app.get("/admin/config")
+async def get_admin_config(auth: AuthContext = Depends(_require_admin)):
+    """Return non-secret runtime configuration."""
+    return {
+        "auth_required": is_auth_required(),
+        "embedding_model": get_embedding_model_name(),
+        "similarity_threshold": get_similarity_threshold(),
+        "max_content_length": get_max_content_length(),
+        "rate_limit_search": get_rate_limit_search(),
+        "rate_limit_embed": get_rate_limit_embed(),
+        "cors_origins": get_cors_origins(),
+        "categorizer_enabled": is_categorizer_enabled(),
+        "log_level": get_log_level(),
+        "debug": is_debug_enabled(),
+        "db_pool_min": get_db_pool_min_size(),
+        "db_pool_max": get_db_pool_max_size(),
+    }
+
+
 # ============== CATCH-ALL ROUTE (must be last) ==============
 
 @app.get("/{guid}", response_model=DocumentResponse)
-async def get_document(guid: str):
+async def get_document(guid: str, auth: AuthContext = Depends(resolve_auth)):
     """Get a document by its GUID (must be last route to avoid shadowing specific routes)"""
     try:
         # Validate GUID format
@@ -2217,8 +2693,8 @@ async def get_document(guid: str):
                 detail="Not found"
             )
 
-        # Get document from database
-        document = await document_crud.get_document_by_guid(guid)
+        # Get document from database (RLS filters by workspace)
+        document = await document_crud.with_auth(auth).get_document_by_guid(guid)
 
         if not document:
             raise HTTPException(

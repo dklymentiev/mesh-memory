@@ -9,11 +9,33 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def get_database_url() -> str:
-    """Get PostgreSQL database URL from environment"""
+    """Get PostgreSQL database URL from environment (superuser, for migrations)"""
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise ValueError("DATABASE_URL environment variable is required")
     return database_url
+
+
+def get_app_database_url() -> str:
+    """Get PostgreSQL URL for the application role (RLS enforced).
+
+    Falls back to DATABASE_URL if DATABASE_URL_APP is not set, which means
+    RLS will be bypassed (superuser ignores RLS).  A warning is logged.
+    """
+    url = os.getenv("DATABASE_URL_APP")
+    if url:
+        return url
+    import logging
+    logging.getLogger(__name__).warning(
+        "DATABASE_URL_APP not set -- using superuser connection. "
+        "RLS will NOT be enforced. Set DATABASE_URL_APP for production."
+    )
+    return get_database_url()
+
+
+def get_app_role_password() -> str:
+    """Password for the mesh_app database role (created during migration)."""
+    return os.getenv("MESH_APP_PASSWORD", "")
 
 def get_ip_whitelist() -> List[str]:
     """Get IP whitelist from environment (comma-separated CIDR ranges)
@@ -93,7 +115,7 @@ def get_db_pool_max_size() -> int:
 def is_auth_required() -> bool:
     """Whether API key authentication is required.
     When true, all requests (except /health) must include X-API-Key header."""
-    return os.getenv("AUTH_REQUIRED", "false").lower() in ("true", "1", "yes")
+    return os.getenv("AUTH_REQUIRED", "true").lower() in ("true", "1", "yes")
 
 def get_api_keys() -> List[str]:
     """Get valid API keys from environment (comma-separated).
@@ -110,6 +132,10 @@ def get_rate_limit_search() -> int:
 def get_rate_limit_embed() -> int:
     """Max requests per minute for /embed endpoints (0 = unlimited)"""
     return int(os.getenv("RATE_LIMIT_EMBED", "30"))
+
+def get_rate_limit_heavy() -> int:
+    """Max requests per minute for CPU-intensive endpoints like /bulk, create, delete (0 = unlimited)"""
+    return int(os.getenv("RATE_LIMIT_HEAVY", "30"))
 
 def trust_proxy_headers() -> bool:
     """Whether to trust proxy headers (CF-Connecting-IP, X-Real-IP) for client IP.

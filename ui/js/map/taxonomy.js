@@ -1,9 +1,9 @@
-import { API, CAT_PALETTE } from './constants.js';
+import { API, CAT_PALETTE, wsHeaders } from './constants.js';
 import { state } from './state.js';
 
 export async function loadTaxonomy() {
   try {
-    const r = await fetch(API + '/categorizer/taxonomy');
+    const r = await fetch(API + '/categorizer/taxonomy', { headers: wsHeaders() });
     const data = await r.json();
     const cats = (data.taxonomy && data.taxonomy.categories) || [];
     cats.forEach((c, i) => {
@@ -54,7 +54,7 @@ export function getCatName(catId) {
 }
 
 export function extractTagLabel(t) {
-  if (t.startsWith('dacs-path:')) return t.split('/').pop().replace(/\.md$/, '');
+  if (t.startsWith('doci-path:')) return t.split('/').pop().replace(/\.md$/, '');
   if (t.startsWith('topic:')) return t.slice(6);
   if (t.includes(':')) return t.split(':').slice(1).join(':');
   return t;

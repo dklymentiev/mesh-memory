@@ -25,49 +25,53 @@ from mcp.server.fastmcp import FastMCP
 
 MESH_URL = os.environ.get("MESH_API_URL", "http://localhost:8000").rstrip("/")
 MESH_KEY = os.environ.get("MESH_API_KEY", "")
+MESH_WORKSPACE = os.environ.get("MESH_WORKSPACE", "")  # default workspace for MCP
 
 # Schema cache (loaded on first tool call)
 _schema_cache: dict | None = None
 
 
-def _headers() -> dict:
+def _headers(workspace: str | None = None) -> dict:
     h = {"Content-Type": "application/json"}
     if MESH_KEY:
         h["X-API-Key"] = MESH_KEY
+    ws = workspace or MESH_WORKSPACE
+    if ws:
+        h["X-Workspace"] = ws
     return h
 
 
-async def _get(path: str, params: dict = None) -> dict:
+async def _get(path: str, params: dict = None, workspace: str | None = None) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(f"{MESH_URL}{path}", headers=_headers(), params=params)
+        r = await client.get(f"{MESH_URL}{path}", headers=_headers(workspace), params=params)
         r.raise_for_status()
         return r.json()
 
 
-async def _post(path: str, body: dict) -> dict:
+async def _post(path: str, body: dict, workspace: str | None = None) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(f"{MESH_URL}{path}", headers=_headers(), json=body)
+        r = await client.post(f"{MESH_URL}{path}", headers=_headers(workspace), json=body)
         r.raise_for_status()
         return r.json()
 
 
-async def _put(path: str, body: dict) -> dict:
+async def _put(path: str, body: dict, workspace: str | None = None) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.put(f"{MESH_URL}{path}", headers=_headers(), json=body)
+        r = await client.put(f"{MESH_URL}{path}", headers=_headers(workspace), json=body)
         r.raise_for_status()
         return r.json()
 
 
-async def _patch(path: str, body: dict) -> dict:
+async def _patch(path: str, body: dict, workspace: str | None = None) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.patch(f"{MESH_URL}{path}", headers=_headers(), json=body)
+        r = await client.patch(f"{MESH_URL}{path}", headers=_headers(workspace), json=body)
         r.raise_for_status()
         return r.json()
 
 
-async def _delete(path: str) -> dict:
+async def _delete(path: str, workspace: str | None = None) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.delete(f"{MESH_URL}{path}", headers=_headers())
+        r = await client.delete(f"{MESH_URL}{path}", headers=_headers(workspace))
         r.raise_for_status()
         return r.json()
 
@@ -132,18 +136,64 @@ mcp = FastMCP(
 # ──────────────────────────────────────────
 
 @mcp.tool()
-async def mesh_search(query: str, limit: int = 10, tags: list[str] | None = None) -> str:
+async def mesh_focus(workspace: str, prefetch: bool = True, limit: int = 5) -> str:
+    """Switch active workspace. All subsequent calls use this workspace by default.
+
+    Optionally prefetches recent documents for immediate context.
+
+    Args:
+        workspace: Workspace name to switch to (e.g. "hq-architect", "default")
+        prefetch: Load recent documents after switching (default True)
+        limit: How many recent docs to prefetch (default 5)
+    """
+    global MESH_WORKSPACE
+    previous = MESH_WORKSPACE or "(none)"
+    MESH_WORKSPACE = workspace
+
+    lines = [f"Workspace: {previous} -> {workspace}"]
+
+    if prefetch:
+        try:
+            body = {"query": workspace, "limit": limit}
+            resp = await _post("/search", body, workspace=workspace)
+            docs = resp.get("results", []) if isinstance(resp, dict) else resp if isinstance(resp, list) else []
+            if docs:
+                lines.append(f"\nRecent {len(docs)} documents in '{workspace}':\n")
+                for doc in docs:
+                    guid = doc.get("guid", "?")
+                    tags_str = ", ".join(doc.get("tags", []))
+                    preview = (doc.get("content", ""))[:120]
+                    created = doc.get("created_at", "")[:10] if doc.get("created_at") else ""
+                    lines.append(f"**{guid}** ({created}) [{tags_str}]")
+                    lines.append(f"  {preview}")
+                    lines.append("")
+            else:
+                lines.append(f"\nWorkspace '{workspace}' is empty.")
+        except Exception as e:
+            lines.append(f"\nPrefetch failed: {e}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def mesh_search(query: str, limit: int = 10, tags: list[str] | None = None,
+                      workspaces: dict[str, float] | None = None,
+                      workspace: str | None = None) -> str:
     """Semantic search across all documents in Mesh memory.
 
     Args:
         query: What to search for (natural language)
         limit: Max results (default 10)
         tags: Optional tag filter (AND logic)
+        workspaces: Weighted multi-workspace search, e.g. {"sysadmin": 0.7, "security": 0.2}
+        workspace: Target workspace (uses default if not set). Ignored if workspaces is set.
     """
     body = {"query": query, "limit": limit}
     if tags:
         body["tags"] = tags
-    data = await _post("/search", body)
+    if workspaces:
+        body["workspaces"] = workspaces
+    data = await _post("/search", body, workspace=workspace)
     results = data.get("results", [])
     if not results:
         return f"No results found for: {query}"
@@ -162,7 +212,8 @@ async def mesh_search(query: str, limit: int = 10, tags: list[str] | None = None
 
 
 @mcp.tool()
-async def mesh_add(content: str, tags: list[str] | None = None, source: str = "mcp") -> str:
+async def mesh_add(content: str, tags: list[str] | None = None, source: str = "mcp",
+                   workspace: str | None = None) -> str:
     """Add a new document to Mesh memory.
 
     Date and source tags are added automatically. After indexing, type/project/topic
@@ -173,11 +224,12 @@ async def mesh_add(content: str, tags: list[str] | None = None, source: str = "m
         content: Document text (min 10 chars)
         tags: Optional tags. Auto-tags won't override these.
         source: Origin (default: "mcp")
+        workspace: Target workspace (uses default if not set)
     """
     body = {"content": content, "source": source}
     if tags:
         body["tags"] = tags
-    data = await _put("/", body)
+    data = await _put("/", body, workspace=workspace)
     guid = data.get("guid", "?")
     final_tags = data.get("tags", [])
     return (
@@ -193,7 +245,9 @@ async def mesh_update(
     content: str | None = None,
     tags: list[str] | None = None,
     add_tags: list[str] | None = None,
-    remove_tags: list[str] | None = None
+    remove_tags: list[str] | None = None,
+    pinned: bool | None = None,
+    workspace: str | None = None,
 ) -> str:
     """Update an existing document's content or tags.
 
@@ -203,6 +257,8 @@ async def mesh_update(
         tags: Replace all tags with these
         add_tags: Add tags to existing
         remove_tags: Remove tags from existing
+        pinned: Pin document to top of workspace (True/False)
+        workspace: Target workspace (uses default if not set)
     """
     body = {}
     if content is not None:
@@ -213,9 +269,11 @@ async def mesh_update(
         body["add_tags"] = add_tags
     if remove_tags is not None:
         body["remove_tags"] = remove_tags
+    if pinned is not None:
+        body["pinned"] = pinned
     if not body:
-        return "Nothing to update. Provide content, tags, add_tags, or remove_tags."
-    data = await _patch(f"/{guid}", body)
+        return "Nothing to update. Provide content, tags, add_tags, remove_tags, or pinned."
+    data = await _patch(f"/{guid}", body, workspace=workspace)
     updated = data.get("updated_fields", [])
     final_tags = data.get("tags", [])
     return (
@@ -226,26 +284,28 @@ async def mesh_update(
 
 
 @mcp.tool()
-async def mesh_delete(guid: str) -> str:
+async def mesh_delete(guid: str, workspace: str | None = None) -> str:
     """Delete a document from Mesh memory.
 
     Args:
         guid: Document GUID to delete (doc_XXXXXXXX)
+        workspace: Target workspace (uses default if not set)
     """
-    data = await _delete(f"/{guid}")
+    data = await _delete(f"/{guid}", workspace=workspace)
     if data.get("deleted"):
         return f"Deleted: {guid}"
     return f"Failed to delete {guid}: {data}"
 
 
 @mcp.tool()
-async def mesh_get(guid: str) -> str:
+async def mesh_get(guid: str, workspace: str | None = None) -> str:
     """Get a specific document by its GUID.
 
     Args:
         guid: Document GUID (format: doc_XXXXXXXX)
+        workspace: Target workspace (uses default if not set)
     """
-    data = await _get(f"/{guid}")
+    data = await _get(f"/{guid}", workspace=workspace)
     tags_str = ", ".join(data.get("tags", []))
     created = data.get("created_at", "")[:19] if data.get("created_at") else ""
     return (
@@ -258,20 +318,22 @@ async def mesh_get(guid: str) -> str:
 
 
 @mcp.tool()
-async def mesh_bytag(tags: list[str], limit: int = 10, offset: int = 0) -> str:
+async def mesh_bytag(tags: list[str], limit: int = 10, offset: int = 0,
+                     workspace: str | None = None) -> str:
     """List documents filtered by tags (AND logic).
 
     Args:
         tags: Tags to filter by
         limit: Max documents (default 10)
         offset: Skip N documents for pagination
+        workspace: Target workspace (uses default if not set)
     """
     params = {"limit": limit, "offset": offset}
     for t in tags:
         params.setdefault("tag", [])
         if isinstance(params["tag"], list):
             params["tag"].append(t)
-    data = await _get("/", params)
+    data = await _get("/", params, workspace=workspace)
     if isinstance(data, dict) and "service" in data:
         return "No documents found"
     if not data:
@@ -294,7 +356,8 @@ async def mesh_versions(
     guid: str,
     threshold: float = 0.85,
     limit: int = 20,
-    same_project: bool = True
+    same_project: bool = True,
+    workspace: str | None = None,
 ) -> str:
     """Find chronological version chain of a document.
 
@@ -303,13 +366,14 @@ async def mesh_versions(
         threshold: Similarity threshold 0.5-0.99 (default 0.85)
         limit: Max versions (default 20)
         same_project: Only same project docs (default True)
+        workspace: Target workspace (uses default if not set)
     """
     params = {
         "threshold": threshold,
         "limit": limit,
         "same_project": str(same_project).lower()
     }
-    data = await _get(f"/versions/{guid}", params)
+    data = await _get(f"/versions/{guid}", params, workspace=workspace)
     source = data.get("source", {})
     versions = data.get("versions", [])
     count = data.get("count", 0)
@@ -336,14 +400,14 @@ async def mesh_versions(
 
 
 @mcp.tool()
-async def mesh_projects(limit: int = 30) -> str:
+async def mesh_projects(limit: int = 30, workspace: str | None = None) -> str:
     """List all projects with document counts and activity dates."""
     schema = await _get_schema()
     prefix = _project_prefix(schema)
     if not prefix:
         return "No project prefix configured in schema."
 
-    data = await _get("/activity", {"prefix": prefix, "limit": limit})
+    data = await _get("/activity", {"prefix": prefix, "limit": limit}, workspace=workspace)
     if not data:
         return "No projects found."
 
@@ -359,32 +423,41 @@ async def mesh_projects(limit: int = 30) -> str:
 
 
 @mcp.tool()
-async def mesh_stats() -> str:
+async def mesh_stats(workspace: str | None = None) -> str:
     """Get Mesh memory statistics."""
-    data = await _get("/stats")
-    return (
-        f"Documents: {data.get('documents', 0)}\n"
-        f"Indexed: {data.get('indexed', 0)}\n"
-        f"Pending: {data.get('pending', 0)}\n"
-        f"Projects: {data.get('projects', 0)}\n"
-        f"Tags: {data.get('tags', 0)}\n"
-        f"Queue: {data.get('queue_size', 0)}\n"
-        f"Last update: {data.get('last_update', '?')}"
-    )
+    data = await _get("/stats", workspace=workspace)
+    lines = [
+        f"Documents: {data.get('documents', 0)}",
+        f"Indexed: {data.get('indexed', 0)}",
+        f"Pending: {data.get('pending', 0)}",
+        f"Projects: {data.get('projects', 0)}",
+        f"Tags: {data.get('tags', 0)}",
+        f"Queue: {data.get('queue_size', 0)}",
+        f"Last update: {data.get('last_update', '?')}",
+    ]
+    workspaces = data.get("workspaces", [])
+    if workspaces:
+        lines.append(f"\nWorkspaces ({len(workspaces)}):")
+        for ws in workspaces:
+            last = (ws.get("last_activity") or "?")[:10]
+            lines.append(f"  {ws['workspace']}  ({ws['documents']} docs, last: {last})")
+    return "\n".join(lines)
 
 
 @mcp.tool()
-async def mesh_recent(limit: int = 10, type: str | None = None) -> str:
+async def mesh_recent(limit: int = 10, type: str | None = None,
+                      workspace: str | None = None) -> str:
     """Get recent documents.
 
     Args:
         limit: Max documents (default 10)
         type: Optional type filter (worklog, note, artifact, etc.)
+        workspace: Target workspace (uses default if not set)
     """
-    params = {"limit": limit}
+    params = {"limit": limit, "all": "true"}
     if type:
         params["tag"] = f"type:{type}"
-    data = await _get("/", params)
+    data = await _get("/", params, workspace=workspace)
     if isinstance(data, dict) and "service" in data:
         return "No documents found"
     if not data:
@@ -402,17 +475,19 @@ async def mesh_recent(limit: int = 10, type: str | None = None) -> str:
 
 
 @mcp.tool()
-async def mesh_tags(prefix: str | None = None, limit: int = 50) -> str:
+async def mesh_tags(prefix: str | None = None, limit: int = 50,
+                    workspace: str | None = None) -> str:
     """List all unique tags with document counts.
 
     Args:
         prefix: Filter by prefix, e.g. "type:", "guid:", "topic:"
         limit: Max tags (default 50)
+        workspace: Target workspace (uses default if not set)
     """
     params = {"limit": limit}
     if prefix:
         params["prefix"] = prefix
-    data = await _get("/tags", params)
+    data = await _get("/tags", params, workspace=workspace)
     tags = data.get("tags", [])
     if not tags:
         return f"No tags found{' with prefix ' + prefix if prefix else ''}"

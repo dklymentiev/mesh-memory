@@ -2,9 +2,20 @@
 """
 Pydantic models for API requests and responses
 """
+from dataclasses import dataclass, field as dc_field
 from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel, Field
+
+
+# ---- Auth context (not a Pydantic model -- internal only) ----
+
+@dataclass
+class AuthContext:
+    """Resolved authentication context for the current request."""
+    workspace: str = "default"           # active workspace
+    workspaces: list = dc_field(default_factory=lambda: ["default"])  # all allowed
+    is_admin: bool = False
 
 class DocumentCreateRequest(BaseModel):
     """Request model for creating a document"""
@@ -26,12 +37,17 @@ class DocumentResponse(BaseModel):
     created_at: datetime = Field(..., description="Document creation timestamp")
     updated_at: Optional[datetime] = Field(default=None, description="Last update timestamp")
     directory: str = Field(..., description="Assigned directory path")
+    workspace: str = Field(default="default", description="Workspace ID")
+    pinned: bool = Field(default=False, description="Pinned to top of workspace")
 
 class SearchRequest(BaseModel):
     """Request model for semantic search"""
     query: str = Field(..., description="Search query", min_length=1)
     limit: Optional[int] = Field(default=10, description="Maximum number of results", ge=1, le=100)
     tags: Optional[List[str]] = Field(default=None, description="Filter results to documents containing ALL of these tags")
+    date_from: Optional[datetime] = Field(default=None, description="Only return documents created on or after this date")
+    date_to: Optional[datetime] = Field(default=None, description="Only return documents created on or before this date")
+    workspaces: Optional[dict] = Field(default=None, description="Weighted multi-workspace search: {workspace: weight 0.0-1.0}")
 
 class SearchResult(BaseModel):
     """Individual search result"""
@@ -39,8 +55,10 @@ class SearchResult(BaseModel):
     content: str = Field(..., description="Document content")
     tags: List[str] = Field(..., description="Document tags")
     created_at: datetime = Field(..., description="Document creation timestamp")
+    updated_at: Optional[datetime] = Field(default=None, description="Last update timestamp")
     similarity_score: float = Field(..., description="Similarity score (0-1)")
     directory: str = Field(..., description="Document directory")
+    workspace: str = Field(default="default", description="Workspace ID")
 
 class SearchResponse(BaseModel):
     """Response model for search results"""

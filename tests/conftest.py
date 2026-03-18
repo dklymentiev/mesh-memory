@@ -191,6 +191,11 @@ def _make_fake_pool():
 
     async def _fetch(sql, *args):
         s = sql.strip().upper()
+        if "GROUP BY WORKSPACE_ID" in s:
+            # GET /stats workspace summary
+            now = datetime.now(timezone.utc)
+            return [_row(workspace_id="default", doc_count=_store.count(),
+                         last_activity=now)]
         if "UNNEST(TAGS)" in s and ("MAX(UPDATED_AT)" in s or "LAST_ACTIVITY" in s
                                       or "MAX(D.UPDATED_AT)" in s or "COUNT(*)" in s):
             # GET /activity endpoint
@@ -306,14 +311,20 @@ def _doc_response(doc: dict) -> DocumentResponse:
 class FakeDocumentCRUD:
     def __init__(self, pool): self.pool = pool
 
-    async def create_document(self, guid: str, req: DocumentCreateRequest) -> DocumentResponse:
+    def with_auth(self, auth):
+        """Return self -- fakes don't need auth scoping."""
+        return self
+
+    async def create_document(self, guid: str, req: DocumentCreateRequest,
+                              workspace_id: str = "default") -> DocumentResponse:
         doc = _store.add_document(
             guid=guid, content=req.content, tags=req.tags or [],
             filename=req.filename, source=req.source or "api",
         )
         return _doc_response(doc)
 
-    async def upsert_document(self, guid: str, req: DocumentCreateRequest) -> DocumentResponse:
+    async def upsert_document(self, guid: str, req: DocumentCreateRequest,
+                              workspace_id: str = "default") -> DocumentResponse:
         if guid in _store.documents:
             old = _store.documents[guid]
             old["content"] = req.content
@@ -335,11 +346,16 @@ class FakeDocumentCRUD:
 class FakeEmbeddingCRUD:
     def __init__(self, pool): self.pool = pool
 
+    def with_auth(self, auth):
+        """Return self -- fakes don't need auth scoping."""
+        return self
+
     async def store_embedding(self, guid: str, emb: List[float]) -> None:
         _store.embeddings[guid] = emb
 
     async def search_similar_documents(
         self, query_embedding, limit=10, similarity_threshold=0.0, tags=None,
+        date_from=None, date_to=None,
     ) -> List[Tuple[str, float]]:
         results = []
         for guid, doc in _store.documents.items():
@@ -348,10 +364,26 @@ class FakeEmbeddingCRUD:
             results.append((guid, 0.9))
         return results[:limit]
 
+    async def search_similar_chunks(
+        self, query_embedding, limit=10, similarity_threshold=0.0, tags=None,
+        date_from=None, date_to=None,
+    ) -> List[Tuple[str, float]]:
+        return await self.search_similar_documents(
+            query_embedding, limit, similarity_threshold, tags,
+            date_from, date_to,
+        )
+
+    async def has_chunks(self) -> bool:
+        return False
+
 
 
 class FakeMetadataCRUD:
     def __init__(self, pool): self.pool = pool
+
+    def with_auth(self, auth):
+        """Return self -- fakes don't need auth scoping."""
+        return self
 
     async def get_metadata(self, guid: str): return _store.metadata.get(guid)
 
@@ -402,6 +434,7 @@ _mesh_main.document_crud = _fake_doc_crud
 _mesh_main.embedding_crud = _fake_emb_crud
 _mesh_main.metadata_crud = _fake_meta_crud
 _mesh_main.db_pool = _fake_pool
+_mesh_main.migration_pool = _fake_pool
 _mesh_main.embedding_queue = asyncio.Queue()
 
 _app = _mesh_main.app

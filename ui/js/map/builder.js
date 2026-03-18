@@ -391,9 +391,19 @@ export function buildScene() {
   document.getElementById('date-axis').style.display = state.viewMode === 'timeline' ? '' : 'none';
   state.nebulaeMeshes.forEach(m => { m.visible = state.viewMode === 'galaxy'; });
 
-  // Set camera
+  // Set camera -- auto-fit based on scene bounding box
   if (state.viewMode === 'galaxy') {
-    camera.position.set(0, 200, 750);
+    // Compute bounding sphere of all galaxy positions
+    let maxR = 0;
+    for (let i = 0; i < count; i++) {
+      const x = state.posGalaxy[i*3], y = state.posGalaxy[i*3+1], z = state.posGalaxy[i*3+2];
+      const r = Math.sqrt(x*x + y*y + z*z);
+      if (r > maxR) maxR = r;
+    }
+    // Camera distance: fit bounding sphere in view with padding
+    const fov = camera.fov * Math.PI / 180;
+    const fitDist = Math.max(maxR / Math.tan(fov / 2) * 1.3, 80);
+    camera.position.set(0, fitDist * 0.27, fitDist);
   } else {
     camera.position.set(0, 0, Math.max(TL.xSpread * 0.8, totalLaneH * 1.5));
   }
