@@ -423,13 +423,22 @@ class EmbeddingCRUD:
                         params.append(date_to)
                         idx += 1
 
-                    params.append(limit)
                     inner_where = " AND ".join(inner_conditions)
 
                     # Add workspace filter to avoid HNSW + RLS issue (#655)
                     ws = self._auth.workspace if self._auth else "default"
                     inner_where += f" AND c.workspace_id = ${idx}"
                     params.append(ws)
+                    idx += 1
+
+                    # Outer LIMIT must be appended AFTER workspace so that
+                    # every ${N} in the built query maps to the right slot
+                    # in *params. Previously `limit` was appended before the
+                    # workspace filter, which shifted the binding and caused
+                    # `expected str, got int` on the workspace_id slot
+                    # whenever any filter (tags/date_from/date_to) was set.
+                    outer_limit_ref = f"${idx}"
+                    params.append(limit)
                     idx += 1
 
                     rows = await conn.fetch(
@@ -447,7 +456,7 @@ class EmbeddingCRUD:
                         WHERE sim >= $2
                         GROUP BY guid
                         ORDER BY similarity_score DESC
-                        LIMIT ${idx}
+                        LIMIT {outer_limit_ref}
                         """,
                         *params
                     )
