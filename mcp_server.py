@@ -115,6 +115,15 @@ def _schema_summary(schema: dict) -> str:
     return "\n".join(lines)
 
 
+def _parse_tags(tags: list[str] | str | None) -> list[str] | None:
+    """Accept tags as list or comma/space-separated string."""
+    if tags is None:
+        return None
+    if isinstance(tags, str):
+        return [t.strip() for t in tags.replace(",", " ").split() if t.strip()]
+    return tags
+
+
 # ──────────────────────────────────────────
 # MCP Server
 # ──────────────────────────────────────────
@@ -176,7 +185,7 @@ async def mesh_focus(workspace: str, prefetch: bool = True, limit: int = 5) -> s
 
 
 @mcp.tool()
-async def mesh_search(query: str, limit: int = 10, tags: list[str] | None = None,
+async def mesh_search(query: str, limit: int = 10, tags: list[str] | str | None = None,
                       workspaces: dict[str, float] | None = None,
                       workspace: str | None = None) -> str:
     """Semantic search across all documents in Mesh memory.
@@ -184,10 +193,11 @@ async def mesh_search(query: str, limit: int = 10, tags: list[str] | None = None
     Args:
         query: What to search for (natural language)
         limit: Max results (default 10)
-        tags: Optional tag filter (AND logic)
+        tags: Optional tag filter (AND logic). List or comma-separated string.
         workspaces: Weighted multi-workspace search, e.g. {"sysadmin": 0.7, "security": 0.2}
         workspace: Target workspace (uses default if not set). Ignored if workspaces is set.
     """
+    tags = _parse_tags(tags)
     body = {"query": query, "limit": limit}
     if tags:
         body["tags"] = tags
@@ -212,7 +222,7 @@ async def mesh_search(query: str, limit: int = 10, tags: list[str] | None = None
 
 
 @mcp.tool()
-async def mesh_add(content: str, tags: list[str] | None = None, source: str = "mcp",
+async def mesh_add(content: str, tags: list[str] | str | None = None, source: str = "mcp",
                    workspace: str | None = None) -> str:
     """Add a new document to Mesh memory.
 
@@ -222,10 +232,11 @@ async def mesh_add(content: str, tags: list[str] | None = None, source: str = "m
 
     Args:
         content: Document text (min 10 chars)
-        tags: Optional tags. Auto-tags won't override these.
+        tags: Optional tags as list or comma-separated string. Auto-tags won't override these.
         source: Origin (default: "mcp")
         workspace: Target workspace (uses default if not set)
     """
+    tags = _parse_tags(tags)
     body = {"content": content, "source": source}
     if tags:
         body["tags"] = tags
@@ -243,9 +254,9 @@ async def mesh_add(content: str, tags: list[str] | None = None, source: str = "m
 async def mesh_update(
     guid: str,
     content: str | None = None,
-    tags: list[str] | None = None,
-    add_tags: list[str] | None = None,
-    remove_tags: list[str] | None = None,
+    tags: list[str] | str | None = None,
+    add_tags: list[str] | str | None = None,
+    remove_tags: list[str] | str | None = None,
     pinned: bool | None = None,
     workspace: str | None = None,
 ) -> str:
@@ -254,12 +265,15 @@ async def mesh_update(
     Args:
         guid: Document GUID (doc_XXXXXXXX)
         content: New content (replaces existing)
-        tags: Replace all tags with these
-        add_tags: Add tags to existing
-        remove_tags: Remove tags from existing
+        tags: Replace all tags with these. List or comma-separated string.
+        add_tags: Add tags to existing. List or comma-separated string.
+        remove_tags: Remove tags from existing. List or comma-separated string.
         pinned: Pin document to top of workspace (True/False)
         workspace: Target workspace (uses default if not set)
     """
+    tags = _parse_tags(tags)
+    add_tags = _parse_tags(add_tags)
+    remove_tags = _parse_tags(remove_tags)
     body = {}
     if content is not None:
         body["content"] = content
@@ -318,16 +332,17 @@ async def mesh_get(guid: str, workspace: str | None = None) -> str:
 
 
 @mcp.tool()
-async def mesh_bytag(tags: list[str], limit: int = 10, offset: int = 0,
+async def mesh_bytag(tags: list[str] | str, limit: int = 10, offset: int = 0,
                      workspace: str | None = None) -> str:
     """List documents filtered by tags (AND logic).
 
     Args:
-        tags: Tags to filter by
+        tags: Tags to filter by. List or comma-separated string.
         limit: Max documents (default 10)
         offset: Skip N documents for pagination
         workspace: Target workspace (uses default if not set)
     """
+    tags = _parse_tags(tags) or []
     params = {"limit": limit, "offset": offset}
     for t in tags:
         params.setdefault("tag", [])
